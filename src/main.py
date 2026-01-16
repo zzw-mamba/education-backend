@@ -8,7 +8,7 @@ import models
 from database import engine
 
 # 导入路由
-from routers import ocr, db_routes, user
+from routers import ocr, db_routes, user, template, parsing
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,6 +38,8 @@ app.add_middleware(
 app.include_router(ocr.router)
 app.include_router(db_routes.router)
 app.include_router(user.router)
+app.include_router(template.router)
+app.include_router(parsing.router)
 
 class Item(BaseModel):
     name: str

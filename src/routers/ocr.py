@@ -57,13 +57,18 @@ async def ocr_recognize(request: Request, file: UploadFile = File(...)) -> Plain
     with open(upload_path, "wb") as fh:
         fh.write(data)
 
+    # 记录处理前已存在的markdown文件
+    existing_files = set(glob.glob(os.path.join(output_dir, "*.md")))
+
     results = ocr.predict(upload_path)
     for res in results:
         res.save_to_markdown(save_path=output_dir)
 
-    # 读取所有生成的markdown文件并合并
-    markdown_files = sorted(glob.glob(os.path.join(output_dir, "*.md")))
-    for md_file in markdown_files:
+    # 只读取当前生成的markdown文件
+    all_files = set(glob.glob(os.path.join(output_dir, "*.md")))
+    new_files = sorted(all_files - existing_files)
+    
+    for md_file in new_files:
         with open(md_file, "r", encoding="utf-8") as f:
             md_parts.append(f.read())
 
