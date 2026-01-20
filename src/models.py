@@ -43,6 +43,24 @@ class Log(Base):
         return f"<Log(id={self.id}, action='{self.action}')>"
     
     
+class Template(Base):
+    __tablename__ = "templates"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True, comment="模板ID")
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, comment="用户ID")
+    json_path = Column(String(500), nullable=True, comment="JSON文件路径")
+    prompt = Column(Text, nullable=True, comment="提示词")
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="更新时间")
+
+    # 关系定义
+    user = relationship("User", backref="templates")
+
+    def __repr__(self):
+        return f"<Template(id={self.id}, user_id={self.user_id})>"
+
+
 class KBTagRelation(Base):
     __tablename__ = "kb_tag_relation"
     kb_id = Column(Integer, ForeignKey("knowledge_base.id"), primary_key=True)

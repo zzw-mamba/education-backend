@@ -6,22 +6,36 @@ from pydantic import BaseModel
 
 import models
 from database import engine
-
-# 导入路由
+import os
+import torch
 from routers import ocr, db_routes, user, template, parsing
+import subprocess
+import asyncio
+
+SSH_COMMAND = [
+    "ssh", "-N", 
+    "-p", "23686", 
+    "-o", "ServerAliveInterval=60", 
+    "-o", "StrictHostKeyChecking=no",
+    "-L", "8080:10.119.19.154:8000", 
+    "root@cci-proxy.cn-sh-01.sensecore.cn"
+]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    models.Base.metadata.create_all(bind=engine)
+    import os
+    os.environ["INFERENCE_DEVICE_TYPE"] = "cuda"
+    os.environ["DATAPYPES"] = "fp16"
+    from marker.models import create_model_dict
+    app.state.marker = create_model_dict()
 
-    from paddleocr import PaddleOCRVL, PPStructureV3
+    ssh_process = subprocess.Popen(SSH_COMMAND)
 
-    app.state.ocr = PPStructureV3(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False
-    )
+    await asyncio.sleep(2) 
     yield
-    app.state.ocr = None
+
+    del app.state.marker
+    torch.cuda.empty_cache()
 
 
 app = FastAPI(title="Backend Service", version="0.1.0", lifespan=lifespan)

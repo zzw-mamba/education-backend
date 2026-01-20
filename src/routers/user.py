@@ -1,12 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
 from database import get_db
 from models import User
 
 router = APIRouter(prefix="/auth", tags=["User"])
+
+# JWT 配置
+SECRET_KEY = "your-secret-key-here-change-in-production"  # 生产环境应从环境变量读取
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # 密码哈希配置
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -16,6 +24,45 @@ def verify_password(plain_password, hashed_password):
 
 def get_password_hash(password):
     return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# JWT 验证依赖
+security = HTTPBearer()
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+    """
+    验证 JWT Token 并返回当前用户
+    用法：current_user = Depends(get_current_user)
+    """
+    token = credentials.credentials
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    db_user = db.query(User).filter(User.id == int(user_id)).first()
+    if db_user is None:
+        raise credentials_exception
+    
+    return db_user
 
 # Pydantic 模型
 class UserCreate(BaseModel):
@@ -55,7 +102,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     return {"id": new_user.id, "username": new_user.username, "email": new_user.email}
 
-@router.post("/login")
+@router.post("/login", status_code=status.HTTP_200_OK)
 def login(user: UserLogin, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(
         or_(
@@ -70,9 +117,17 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
     if not verify_password(user.password, db_user.password_hash):
         raise HTTPException(status_code=400, detail="Incorrect username or password")
     
-    # 实际项目中应返回 JWT Token，这里仅返回用户信息
+    # 创建 JWT Token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(db_user.id), "username": db_user.username},
+        expires_delta=access_token_expires
+    )
+    
     return {
-        "message": "Login successful",
+        "status": 200,
+        "access_token": access_token,
+        "token_type": "bearer",
         "user": {
             "id": db_user.id,
             "username": db_user.username,
@@ -108,3 +163,15 @@ def change_password(data: ChangePassword, db: Session = Depends(get_db)):
     db_user.password_hash = get_password_hash(data.new_password)
     db.commit()
     return {"message": "Password updated successfully"}
+
+@router.get("/me", status_code=status.HTTP_200_OK)
+def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """
+    获取当前登录用户信息
+    需要在请求头中携带: Authorization: Bearer <token>
+    """
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email
+    }
