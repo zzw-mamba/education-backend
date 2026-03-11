@@ -1,4 +1,9 @@
+__pycache__
+
+/template_json
+/analysis_results
+/temp
+/temp_uploads
+/uploaded_files
 /bibs
 /ocr_output
-__pycache__
-1.py

@@ -48,9 +48,14 @@ class Template(Base):
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True, comment="模板ID")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, comment="用户ID")
-    json_path = Column(String(500), nullable=True, comment="JSON文件路径")
-    prompt = Column(Text, nullable=True, comment="提示词")
-    
+    icon_path = Column(String(100), nullable=True, comment="图标文件路径")
+    prompt = Column(Text, nullable=False, comment="提示词")
+    name = Column(String(50), nullable=False, comment="模板名称")
+    category = Column(Integer, nullable=True, default=0, comment="模板类别")
+    description = Column(Text, nullable=True, comment="模板描述")
+    example = Column(Text, nullable=True, comment="示例")
+    labels = Column(String(200), nullable=True, comment="标签，逗号分隔")
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="更新时间")
 

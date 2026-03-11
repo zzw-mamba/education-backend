@@ -5,44 +5,53 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import models
-from database import engine
+from database import engine, init_db
 import os
-import torch
-from routers import ocr, db_routes, user, template, parsing
+from routers import ocr, db_routes, user, template, parsing, graphrag_routes
 import subprocess
 import asyncio
+from graphrag.graphrag_service import get_graphrag_service
+
+LLM_IP = os.getenv("LLM_IP")
+LOCAL_EMBEDDING_IP = os.getenv("LOCAL_EMBEDDING_IP")
 
 SSH_COMMAND = [
     "ssh", "-N", 
     "-p", "23686", 
     "-o", "ServerAliveInterval=60", 
     "-o", "StrictHostKeyChecking=no",
-    "-L", "8080:10.119.19.154:8000", 
+    "-L", "8080:" + LLM_IP + ":8000",
+    "-L", "9090:" + LOCAL_EMBEDDING_IP + ":8000",
     "root@cci-proxy.cn-sh-01.sensecore.cn"
 ]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import os
-    os.environ["INFERENCE_DEVICE_TYPE"] = "cuda"
-    os.environ["DATAPYPES"] = "fp16"
-    from marker.models import create_model_dict
-    app.state.marker = create_model_dict()
-
     ssh_process = subprocess.Popen(SSH_COMMAND)
-
+    init_db()
+    auto_setup_local_neo4j = os.getenv("AUTO_SETUP_LOCAL_NEO4J", "false").lower() == "true"
+    if auto_setup_local_neo4j:
+        try:
+            graphrag_service = get_graphrag_service()
+            graphrag_service.setup_local_database(create_vector_index=True, force_recreate_index=False)
+            print("[GraphRAG] ✓ 本地 Neo4j schema/index 初始化完成")
+        except Exception as e:
+            print(f"[GraphRAG] ✗ 本地 Neo4j 自动初始化失败: {e}")
     await asyncio.sleep(2) 
     yield
 
-    del app.state.marker
-    torch.cuda.empty_cache()
+    if ssh_process.poll() is None:  # 检查SSH进程是否还在运行
+        ssh_process.terminate()     # 终止进程
+        ssh_process.wait()          # 等待进程退出
+        print(f"[SSH] 进程（PID: {ssh_process.pid}）已终止")
+
 
 
 app = FastAPI(title="Backend Service", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 或指定具体域名，如 ["http://localhost:3000"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,6 +63,7 @@ app.include_router(db_routes.router)
 app.include_router(user.router)
 app.include_router(template.router)
 app.include_router(parsing.router)
+app.include_router(graphrag_routes.router)
 
 class Item(BaseModel):
     name: str

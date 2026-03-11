@@ -2,7 +2,6 @@ import json
 import time
 import os
 import uuid
-import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
@@ -15,13 +14,15 @@ except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from prompt import MATERIAL_PARSING_PROMPT
 
+try:
+    from utils.model import ask_messages, LLMError
+except ImportError:
+    from model import ask_messages, LLMError
+
 load_dotenv()
-LLM_API_BASE = os.getenv("LLM_API_BASE")
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", 60.0))
-MODEL_NAME = os.getenv("MODEL_NAME")
 
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ANALYSIS_OUTPUT_DIR = os.path.join(BASE_DIR, "analysis_results")
 os.makedirs(ANALYSIS_OUTPUT_DIR, exist_ok=True)
 
@@ -114,24 +115,19 @@ def call_llm_api(prompt, content):
     """
     调用大模型 API 进行处理
     """
-    headers = {
-        "Content-Type": "application/json",
-        # "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}" 
-    }
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
+    try:
+        result = ask_messages(
+            messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": content[:3000]}
         ],
-        "temperature": 0.3,
-        "max_tokens": 16384,
-    }
-
-    response = requests.post(f"{LLM_API_BASE}/chat/completions", json=payload, headers=headers, timeout=LLM_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+            temperature=0.3,
+            max_tokens=16384,
+        )
+        # 与原结构保持兼容，调用方继续从 choices[0].message.content 取值
+        return result.raw
+    except LLMError as exc:
+        raise RuntimeError(f"调用大模型服务失败: {exc}") from exc
 
 
 def process_material_workflow(material_item):

@@ -7,7 +7,7 @@ from typing import List
 import os
 
 from database import get_db
-import models  # 确保你之前的 User, KnowledgeBase, Tag 等模型都在这里
+import models
 from deep_translator import GoogleTranslator
 from nltk.corpus import wordnet
 import re

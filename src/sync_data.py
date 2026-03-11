@@ -1,4 +1,5 @@
 import os
+import re
 import fitz  # PyMuPDF
 import bibtexparser
 import jieba.analyse
