@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import models
 from database import engine, init_db
 import os
-from routers import ocr, db_routes, user, template, parsing, graphrag_routes, neo4j_routes
+from routers import ocr, db_routes, user, template, parsing, graphrag_routes
 import subprocess
 import asyncio
 from graphrag.graphrag_service import get_graphrag_service
@@ -72,7 +72,6 @@ app.include_router(user.router)
 app.include_router(template.router)
 app.include_router(parsing.router)
 app.include_router(graphrag_routes.router)
-app.include_router(neo4j_routes.router)
 
 class Item(BaseModel):
     name: str

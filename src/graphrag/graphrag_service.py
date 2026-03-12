@@ -54,22 +54,6 @@ class LocalEmbeddings:
         return [self.embed_query(t) for t in texts]
 
 
-def _jsonable(value: Any) -> Any:
-    """将任意对象尽可能转换为可 JSON 序列化的结构。"""
-    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
-        return value
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if hasattr(value, "dict"):
-        return value.dict()
-    if hasattr(value, "__dict__"):
-        output = {}
-        for k, v in value.__dict__.items():
-            output[k] = _jsonable(v)
-        return output
-    return str(value)
-
-
 def _normalize_section_name(raw_title: str) -> str:
     """将章节标题标准化为统一的章节名称。"""
     title = (raw_title or "").strip().lower()
@@ -947,53 +931,6 @@ class GraphRAGService:
         finally:
             db.close()
 
-    def chunk_and_store_from_mysql(
-        self,
-        paper_ids: Optional[List[int]] = None,
-        limit: int = 100,
-        chunk_size: int = 800,
-        chunk_overlap: int = 120,
-        auto_extract_entities: bool = True,
-    ) -> Dict[str, Any]:
-        """同步接口别名：分块后写入 Neo4j。"""
-        return self.sync_from_mysql_knowledge_base(
-            paper_ids=paper_ids,
-            limit=limit,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            auto_extract_entities=auto_extract_entities,
-        )
-
-    def upsert_chunks(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """将外部传入的切片列表标准化并批量写入图数据库。"""
-        self._ensure_embedding_ready()
-        rows = []
-        for i, chunk in enumerate(chunks):
-            chunk_id = str(chunk.get("id") or chunk.get("chunk_id") or "").strip()
-            text = str(chunk.get("text") or "").strip()
-            paper_id = chunk.get("paper_id", -1)
-            title = chunk.get("title", "Adhoc Paper")
-            year = chunk.get("year")
-            index = chunk.get("index", i)
-            section_name = chunk.get("section_name", "Body")
-            key_entities = chunk.get("key_entities") or []
-            entities = chunk.get("entities") or []
-            if chunk_id and text:
-                rows.append(
-                    {
-                        "paper_id": int(paper_id),
-                        "title": title,
-                        "year": year,
-                        "chunk_id": chunk_id,
-                        "text": text,
-                        "index": index,
-                        "section_name": section_name,
-                        "key_entities": key_entities,
-                        "entities": entities,
-                    }
-                )
-        self.ensure_vector_index(force_recreate=False)
-        return self.upsert_paper_chunks(rows)
 
     def similarity_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
         """基于向量索引执行相似度检索。"""
