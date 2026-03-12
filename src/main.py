@@ -11,6 +11,7 @@ from routers import ocr, db_routes, user, template, parsing, graphrag_routes
 import subprocess
 import asyncio
 from graphrag.graphrag_service import get_graphrag_service
+from neoTools.neo4j_config import init_neo4j_driver, close_neo4j_driver, Neo4jConnectionError
 
 LLM_IP = os.getenv("LLM_IP")
 LOCAL_EMBEDDING_IP = os.getenv("LOCAL_EMBEDDING_IP")
@@ -29,6 +30,11 @@ SSH_COMMAND = [
 async def lifespan(app: FastAPI):
     ssh_process = subprocess.Popen(SSH_COMMAND)
     init_db()
+    try:
+        init_neo4j_driver()
+    except Neo4jConnectionError as e:
+        print(f"[Neo4j] ✗ 启动时初始化失败，将在请求时重试: {e}")
+
     auto_setup_local_neo4j = os.getenv("AUTO_SETUP_LOCAL_NEO4J", "false").lower() == "true"
     if auto_setup_local_neo4j:
         try:
@@ -39,6 +45,8 @@ async def lifespan(app: FastAPI):
             print(f"[GraphRAG] ✗ 本地 Neo4j 自动初始化失败: {e}")
     await asyncio.sleep(2) 
     yield
+
+    close_neo4j_driver()
 
     if ssh_process.poll() is None:  # 检查SSH进程是否还在运行
         ssh_process.terminate()     # 终止进程
