@@ -4,7 +4,7 @@ Neo4j 图数据库配置文件
 """
 
 from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
 import os
 from dotenv import load_dotenv
 
@@ -18,9 +18,17 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 # 创建Neo4j驱动
 driver = None
 
-def init_neo4j_driver():
+
+class Neo4jConnectionError(RuntimeError):
+    """Neo4j 连接不可用时抛出的统一异常。"""
+
+
+def init_neo4j_driver(force: bool = False):
     """初始化Neo4j驱动"""
     global driver
+    if driver is not None and not force:
+        return driver
+
     try:
         driver = GraphDatabase.driver(
             NEO4J_URI, 
@@ -32,22 +40,29 @@ def init_neo4j_driver():
             session.run("RETURN 1")
         print("✓ Neo4j 连接成功")
         return driver
-    except ServiceUnavailable as e:
+    except (ServiceUnavailable, Neo4jError, OSError) as e:
+        driver = None
         print(f"✗ 无法连接到Neo4j: {e}")
-        raise
+        raise Neo4jConnectionError(f"无法连接到 Neo4j: {e}") from e
+
+
+def ensure_neo4j_driver():
+    """返回已初始化的 Neo4j driver；如果尚未初始化则自动初始化。"""
+    if driver is None:
+        return init_neo4j_driver()
+    return driver
 
 def close_neo4j_driver():
     """关闭Neo4j驱动"""
     global driver
     if driver:
         driver.close()
+        driver = None
         print("✓ Neo4j 连接已关闭")
 
 def get_neo4j_session():
     """获取Neo4j会话"""
-    if not driver:
-        raise RuntimeError("Neo4j driver 未初始化，请先调用 init_neo4j_driver()")
-    return driver.session()
+    return ensure_neo4j_driver().session()
 
 class Neo4jService:
     """Neo4j 服务类，包含常用操作"""

@@ -34,7 +34,7 @@ class GraphRAGSettings:
             vector_embedding_property=os.getenv("GRAPHRAG_VECTOR_EMBEDDING_PROPERTY", "embedding"),
             vector_text_property=os.getenv("GRAPHRAG_VECTOR_TEXT_PROPERTY", "text"),
             embedding_model=os.getenv("GRAPHRAG_EMBEDDING_MODEL", "Qwen3-Embedding-8B"),
-            embedding_dimensions=int(os.getenv("GRAPHRAG_EMBEDDING_DIMENSIONS", "1536")),
+            embedding_dimensions=int(os.getenv("GRAPHRAG_EMBEDDING_DIMENSIONS", "4096")),
             similarity_fn=os.getenv("GRAPHRAG_SIMILARITY_FN", "cosine"),
             llm_model=os.getenv("GRAPHRAG_LLM_MODEL", "/mnt/chenbaiming/chenbaiming/Qwen3-30B-A3B-Instruct-2507"),
             local_embedding_base_url=os.getenv("LOCAL_EMBEDDING_BASE_URL", "http://localhost:9090"),

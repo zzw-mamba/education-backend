@@ -407,6 +407,31 @@ async def similarity_search(request: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.get("/related-papers/{paper_id}")
+async def related_papers(
+    paper_id: int,
+    top_k: int = 10,
+    per_chunk_k: int = 8,
+    source_chunk_limit: int = 8,
+    evidence_limit: int = 3,
+):
+    """给定论文 ID，返回 GraphRAG 图谱中的相关文章。"""
+    service = _service_or_500()
+    try:
+        result = service.related_papers_by_id(
+            paper_id=paper_id,
+            top_k=top_k,
+            per_chunk_k=per_chunk_k,
+            source_chunk_limit=source_chunk_limit,
+            evidence_limit=evidence_limit,
+        )
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.post("/search")
 async def rag_search(request: SearchRequest):
     """

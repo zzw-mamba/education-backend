@@ -164,6 +164,26 @@ def recommend_similar_multiple(
         for r in result
     ]
 
+
+@router.get("/knowledge/recommend/{kb_id}")
+def recommend_similar_by_tags(
+    kb_id: int,
+    db: Session = Depends(get_db),
+    limit: int = 10,
+):
+    """直接暴露 models.KBService 中基于 MySQL 标签重合度的单篇推荐逻辑。"""
+    result = models.KBService.recommend_similar(db, kb_id, limit)
+    return [
+        {
+            "id": row.id,
+            "title": row.title,
+            "authors": row.authors,
+            "year": row.year,
+            "common_tags": row.common_tags,
+        }
+        for row in result
+    ]
+
 @router.get("/knowledge/file/{file_id}")
 def get_knowledge_file(file_id: int, db: Session = Depends(get_db)):
     # 1. 从数据库查找记录
