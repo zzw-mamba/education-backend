@@ -7,3 +7,4 @@ __pycache__
 /uploaded_files
 /bibs
 /ocr_output
+.env
