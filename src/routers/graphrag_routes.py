@@ -297,39 +297,6 @@ async def sync_from_mysql(request: SyncFromMySQLRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-
-@router.post("/chunk-and-store")
-async def chunk_and_store(request: SyncFromMySQLRequest):
-    """
-    从 MySQL KnowledgeBase 切片并调用 embedding 后写入 Neo4j。
-    
-    Args:
-        request (SyncFromMySQLRequest): 包含论文 ID、切片大小、重叠度、实体抽取配置等
-        
-    Returns:
-        Dict[str, Any]: 包含成功状态、消息和切片存储结果的字典
-        
-    Raises:
-        HTTPException: 当切片或存储过程发生错误时
-    """
-    service = _service_or_500()
-    try:
-        result = service.chunk_and_store_from_mysql(
-            paper_ids=request.paper_ids,
-            limit=request.limit,
-            chunk_size=request.chunk_size,
-            chunk_overlap=request.chunk_overlap,
-            auto_extract_entities=request.auto_extract_entities,
-        )
-        return {
-            "success": True,
-            "message": "切片并存入 Neo4j 成功",
-            **result,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 @router.post("/graph-refined-context")
 async def graph_refined_context(request: PaperSummaryRequest):
     """
