@@ -185,7 +185,7 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
     output: List[Dict[str, str]] = []
     global_index = 0
 
-    # ================= 优化 1：过滤无用章节 =================
+    # 优化：过滤无用章节 
     # 定义需要被丢弃的章节关键词（不区分大小写）
     ignore_keywords = [
         "reference",       # 参考文献 
