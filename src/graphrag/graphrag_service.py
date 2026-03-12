@@ -663,16 +663,28 @@ class GraphRAGService:
         with self.driver.session() as session:
             rows = list(
                 session.run(
-                    "SHOW VECTOR INDEXES YIELD name WHERE name = $name RETURN name",
+                    "SHOW VECTOR INDEXES YIELD name, options WHERE name = $name RETURN name, options",
                     {"name": self.settings.vector_index_name},
                 )
             )
 
             exists = len(rows) > 0
+            existing_dimension = None
+            if exists:
+                options = rows[0].get("options") or {}
+                index_config = options.get("indexConfig") or {}
+                existing_dimension = index_config.get("vector.dimensions")
 
             if exists and force_recreate:
                 session.run(f"DROP INDEX {self.settings.vector_index_name} IF EXISTS")
                 exists = False
+            elif exists and existing_dimension not in (None, self.settings.embedding_dimensions):
+                raise RuntimeError(
+                    f"向量索引 {self.settings.vector_index_name} 的维度为 {existing_dimension}，"
+                    f"但当前配置 GRAPHRAG_EMBEDDING_DIMENSIONS={self.settings.embedding_dimensions}。"
+                    "请调用 /api/graphrag/create-index 并传 force_recreate=true，"
+                    "然后重新执行 /api/graphrag/sync-from-mysql 以重建向量索引和 embedding 数据。"
+                )
 
         if not exists:
             create_vector_index(
@@ -686,6 +698,44 @@ class GraphRAGService:
             return {"created": True, "index_name": self.settings.vector_index_name}
 
         return {"created": False, "index_name": self.settings.vector_index_name}
+
+    def _get_vector_index_dimension(self) -> Optional[int]:
+        """读取当前向量索引的配置维度。"""
+        self._ensure_initialized()
+
+        with self.driver.session() as session:
+            row = session.run(
+                "SHOW VECTOR INDEXES YIELD name, options WHERE name = $name RETURN options",
+                {"name": self.settings.vector_index_name},
+            ).single()
+
+        if not row:
+            return None
+
+        options = row.get("options") or {}
+        index_config = options.get("indexConfig") or {}
+        return index_config.get("vector.dimensions")
+
+    def _validate_query_vector_dimension(self, vector: List[float]) -> int:
+        """校验查询向量维度与向量索引维度一致。"""
+        actual_dimension = len(vector)
+        index_dimension = self._get_vector_index_dimension()
+
+        if index_dimension is None:
+            raise RuntimeError(
+                f"向量索引 {self.settings.vector_index_name} 不存在，请先调用 /api/graphrag/create-index 创建索引。"
+            )
+
+        if actual_dimension != index_dimension:
+            raise RuntimeError(
+                f"向量维度不匹配：索引 {self.settings.vector_index_name} 维度为 {index_dimension}，"
+                f"当前向量维度为 {actual_dimension}。"
+                "这通常表示 embedding 模型已切换但索引未重建。"
+                "请调用 /api/graphrag/create-index 并传 force_recreate=true，"
+                "然后重新执行 /api/graphrag/sync-from-mysql。"
+            )
+
+        return index_dimension
 
     def upsert_paper_chunks(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         """写入论文切片、实体关系与结构化关联边。"""
@@ -949,6 +999,7 @@ class GraphRAGService:
         """基于向量索引执行相似度检索。"""
         self._ensure_embedding_ready()
         query_embedding = self._embed_text(query_text)
+        self._validate_query_vector_dimension(query_embedding)
 
         query = """
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
@@ -993,6 +1044,107 @@ class GraphRAGService:
             "query_text": query_text,
             "top_k": top_k,
             "results": response,
+        }
+
+    def related_papers_by_id(
+        self,
+        paper_id: int,
+        top_k: int = 10,
+        per_chunk_k: int = 8,
+        source_chunk_limit: int = 8,
+        evidence_limit: int = 3,
+    ) -> Dict[str, Any]:
+        """给定论文 ID，基于 Chunk 向量相似度聚合召回相关文章。"""
+        self._ensure_embedding_ready()
+        with self.driver.session() as session:
+            source_row = session.run(
+                """
+                MATCH (p:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(c:Chunk)
+                RETURN p.paper_id AS paper_id, p.title AS title, count(c) AS chunk_count
+                """,
+                {"paper_id": int(paper_id)},
+            ).single()
+
+            if not source_row:
+                raise ValueError(f"论文 {paper_id} 尚未同步到 GraphRAG 图数据库")
+
+            sample_chunk = session.run(
+                """
+                MATCH (:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(c:Chunk)
+                WHERE c.embedding IS NOT NULL
+                RETURN c.embedding AS embedding
+                LIMIT 1
+                """,
+                {"paper_id": int(paper_id)},
+            ).single()
+
+            if not sample_chunk or not sample_chunk.get("embedding"):
+                raise ValueError(f"论文 {paper_id} 缺少可用的 embedding，请先重新同步到 GraphRAG")
+
+            self._validate_query_vector_dimension(sample_chunk["embedding"])
+
+            rows = list(
+                session.run(
+                    """
+                    MATCH (source:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(source_chunk:Chunk)
+                    WHERE source_chunk.embedding IS NOT NULL
+                    WITH source, collect(source_chunk)[0..$source_chunk_limit] AS source_chunks
+                    UNWIND source_chunks AS source_chunk
+                    CALL db.index.vector.queryNodes($index_name, $per_chunk_k, source_chunk.embedding)
+                    YIELD node, score
+                    MATCH (candidate:Paper)-[:HAS_CHUNK]->(node)
+                    WHERE candidate.paper_id <> $paper_id
+                    WITH source, candidate,
+                         collect(DISTINCT {
+                            source_chunk_id: source_chunk.chunk_id,
+                            matched_chunk_id: node.chunk_id,
+                            score: score,
+                            text: substring(coalesce(node.text, ''), 0, 180)
+                         }) AS evidence,
+                         max(score) AS max_score,
+                         avg(score) AS avg_score,
+                         count(DISTINCT node) AS matched_chunks
+                    RETURN
+                      source.paper_id AS source_paper_id,
+                      source.title AS source_title,
+                      candidate.paper_id AS paper_id,
+                      candidate.title AS title,
+                      candidate.year AS year,
+                      max_score,
+                      avg_score,
+                      matched_chunks,
+                      evidence[0..$evidence_limit] AS evidence
+                    ORDER BY avg_score DESC, matched_chunks DESC, max_score DESC
+                    LIMIT $top_k
+                    """,
+                    {
+                        "paper_id": int(paper_id),
+                        "index_name": self.settings.vector_index_name,
+                        "top_k": int(top_k),
+                        "per_chunk_k": int(per_chunk_k),
+                        "source_chunk_limit": int(source_chunk_limit),
+                        "evidence_limit": int(evidence_limit),
+                    },
+                )
+            )
+
+        return {
+            "paper_id": int(source_row["paper_id"]),
+            "title": source_row["title"],
+            "source_chunk_count": source_row["chunk_count"],
+            "top_k": int(top_k),
+            "results": [
+                {
+                    "paper_id": row["paper_id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "max_score": row["max_score"],
+                    "avg_score": row["avg_score"],
+                    "matched_chunks": row["matched_chunks"],
+                    "evidence": row["evidence"],
+                }
+                for row in rows
+            ],
         }
 
     def rag_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:

@@ -4,12 +4,25 @@ Neo4j 相关的API路由
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from pydantic import BaseModel
-from neo4j.neo4j_utils import KnowledgeGraph, GraphAnalysis, UserBehaviorGraph
-import json
+from neoTools.neo4j_utils import KnowledgeGraph, GraphAnalysis, UserBehaviorGraph
+from neoTools.neo4j_config import ensure_neo4j_driver, Neo4jConnectionError
 
-router = APIRouter(prefix="/api/graph", tags=["knowledge-graph"])
+
+def require_neo4j_ready():
+    """在路由执行前确保 Neo4j 可用，避免接口静默返回空结果。"""
+    try:
+        ensure_neo4j_driver()
+    except Neo4jConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Neo4j服务不可用: {exc}") from exc
+
+
+router = APIRouter(
+    prefix="/api/graph",
+    tags=["knowledge-graph"],
+    dependencies=[Depends(require_neo4j_ready)],
+)
 
 
 # ============ Pydantic 模型 ============
@@ -20,11 +33,6 @@ class KBNode(BaseModel):
     content: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[List[str]] = None
-
-
-class SearchQuery(BaseModel):
-    query_text: str
-    limit: Optional[int] = 10
 
 
 class PathRequest(BaseModel):
@@ -57,46 +65,6 @@ async def build_knowledge_graph(kb: KBNode):
         return {"success": True, "message": "知识图谱构建成功"}
     else:
         raise HTTPException(status_code=500, detail="构建知识图谱失败")
-
-
-@router.get("/related-documents/{kb_id}")
-async def get_related_documents(
-    kb_id: int,
-    depth: int = Query(2, ge=1, le=5),
-    limit: int = Query(10, ge=1, le=50)
-):
-    """
-    获取相关文档
-    
-    Args:
-        kb_id: 知识库ID
-        depth: 查询深度
-        limit: 返回数量
-    
-    Returns:
-        相关文档列表
-    """
-    results = KnowledgeGraph.find_related_documents(kb_id, depth)
-    return {"related_documents": results[:limit]}
-
-
-@router.get("/documents-by-tags")
-async def get_documents_by_tags(
-    tags: List[str] = Query(..., description="标签列表"),
-    limit: int = Query(10, ge=1, le=50)
-):
-    """
-    按标签查找文档
-    
-    Args:
-        tags: 标签列表
-        limit: 返回数量
-    
-    Returns:
-        文档列表
-    """
-    results = KnowledgeGraph.find_documents_by_tags(tags, limit)
-    return {"documents": results}
 
 
 # ============ 图分析接口 ============

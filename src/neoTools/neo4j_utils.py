@@ -3,7 +3,7 @@ Neo4j 实用工具模块
 包含知识图谱构建、查询、分析等相关功能
 """
 
-from neo4j_config import Neo4jService
+from .neo4j_config import Neo4jService
 from typing import Dict, List, Tuple, Optional
 import json
 
@@ -57,62 +57,6 @@ class KnowledgeGraph:
             print(f"构建知识图谱出错: {e}")
             return False
     
-    @staticmethod
-    def find_related_documents(kb_id: int, depth: int = 2, 
-                              relation_type: str = "HAS_TAG") -> List[Dict]:
-        """
-        查找相关文档
-        
-        Args:
-            kb_id: 知识库ID
-            depth: 查询深度
-            relation_type: 关系类型
-        
-        Returns:
-            相关文档列表
-        """
-        query = f"""
-        MATCH (kb:KnowledgeBase {{kb_id: $kb_id}})-[:{relation_type}*0..{depth}]-(related)
-        WHERE related:KnowledgeBase AND related.kb_id <> $kb_id
-        RETURN DISTINCT related
-        LIMIT 10
-        """
-        
-        try:
-            results = Neo4jService.execute_query(query, {"kb_id": kb_id})
-            return [dict(record) for record in results]
-        except Exception as e:
-            print(f"查询相关文档出错: {e}")
-            return []
-    
-    @staticmethod
-    def find_documents_by_tags(tags: List[str], limit: int = 10) -> List[Dict]:
-        """
-        按标签查找文档
-        
-        Args:
-            tags: 标签列表
-            limit: 返回结果数量限制
-        
-        Returns:
-            文档列表
-        """
-        tag_list = '", "'.join(tags)
-        query = f"""
-        MATCH (kb:KnowledgeBase)-[:HAS_TAG]->(tag:Tag)
-        WHERE tag.name IN ["{tag_list}"]
-        RETURN kb
-        LIMIT {limit}
-        """
-        
-        try:
-            results = Neo4jService.execute_query(query, {})
-            return [dict(record) for record in results]
-        except Exception as e:
-            print(f"按标签查询文档出错: {e}")
-            return []
-
-
 class GraphAnalysis:
     """图分析工具类"""
     
