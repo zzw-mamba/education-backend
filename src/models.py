@@ -163,11 +163,12 @@ class KBService:
         推荐系统：基于共同标签（标签重合度）
         """
         recommend_sql = text("""
-            SELECT r2.kb_id, COUNT(*) as common_tags
+            SELECT r2.kb_id AS id, k.title, k.authors, k.year, COUNT(*) as common_tags
             FROM kb_tag_relation r1
             JOIN kb_tag_relation r2 ON r1.tag_id = r2.tag_id
+            JOIN knowledge_base k ON r2.kb_id = k.id
             WHERE r1.kb_id = :target_id AND r2.kb_id <> :target_id
-            GROUP BY r2.kb_id
+            GROUP BY r2.kb_id, k.title, k.authors, k.year
             ORDER BY common_tags DESC
             LIMIT :limit
         """)

@@ -297,39 +297,6 @@ async def sync_from_mysql(request: SyncFromMySQLRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-
-@router.post("/chunk-and-store")
-async def chunk_and_store(request: SyncFromMySQLRequest):
-    """
-    从 MySQL KnowledgeBase 切片并调用 embedding 后写入 Neo4j。
-    
-    Args:
-        request (SyncFromMySQLRequest): 包含论文 ID、切片大小、重叠度、实体抽取配置等
-        
-    Returns:
-        Dict[str, Any]: 包含成功状态、消息和切片存储结果的字典
-        
-    Raises:
-        HTTPException: 当切片或存储过程发生错误时
-    """
-    service = _service_or_500()
-    try:
-        result = service.chunk_and_store_from_mysql(
-            paper_ids=request.paper_ids,
-            limit=request.limit,
-            chunk_size=request.chunk_size,
-            chunk_overlap=request.chunk_overlap,
-            auto_extract_entities=request.auto_extract_entities,
-        )
-        return {
-            "success": True,
-            "message": "切片并存入 Neo4j 成功",
-            **result,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 @router.post("/graph-refined-context")
 async def graph_refined_context(request: PaperSummaryRequest):
     """
@@ -403,6 +370,31 @@ async def similarity_search(request: SearchRequest):
     service = _service_or_500()
     try:
         return service.similarity_search(request.query_text, top_k=request.top_k)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/related-papers/{paper_id}")
+async def related_papers(
+    paper_id: int,
+    top_k: int = 10,
+    per_chunk_k: int = 8,
+    source_chunk_limit: int = 8,
+    evidence_limit: int = 3,
+):
+    """给定论文 ID，返回 GraphRAG 图谱中的相关文章。"""
+    service = _service_or_500()
+    try:
+        result = service.related_papers_by_id(
+            paper_id=paper_id,
+            top_k=top_k,
+            per_chunk_k=per_chunk_k,
+            source_chunk_limit=source_chunk_limit,
+            evidence_limit=evidence_limit,
+        )
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
