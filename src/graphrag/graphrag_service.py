@@ -169,11 +169,36 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
     output: List[Dict[str, str]] = []
     global_index = 0
 
+    # 优化：过滤无用章节 
+    # 定义需要被丢弃的章节关键词（不区分大小写）
+    ignore_keywords = [
+        "reference",       # 参考文献 
+        "acknowledgment",  # 致谢
+        "conflict of interest", # 利益冲突
+        "data availability",    # 数据可用性声明
+        "appendix",        # 附录
+        "参考文献", "致谢", "利益冲突"
+    ]
+
     for section in sections:
         section_name = section["section_name"]
+        
+        # 拦截逻辑：一旦章节名字包含了上述词汇，这章就完全不要了
+        if any(kw in section_name.lower() for kw in ignore_keywords):
+            print(f"[DEBUG - 🚀 文本切片优化] 成功拦截并抛弃无用垃圾章节: {section_name}")
+            continue
+
         content = section["content"]
         sub_chunks = _semantic_window_chunks(content, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        for chunk_text in sub_chunks:
+        
+        print(f"\n[DEBUG - 文本切片] 章节: {section_name}")
+        print(f"[DEBUG - 文本切片] 原始文本长度: {len(content)} 字符")
+        print(f"[DEBUG - 文本切片] 切成了 {len(sub_chunks)} 块")
+        
+        for i, chunk_text in enumerate(sub_chunks):
+            if i < 2: # 只打印前两块预览避免刷屏
+                print(f"   [块 {i}] 长度={len(chunk_text)}, 预览: {chunk_text[:50]}...")
+                
             output.append(
                 {
                     "section_name": section_name,
@@ -198,9 +223,11 @@ def _extract_key_entities_from_text(text: str, llm_model: Optional[str] = None) 
         pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*[\[\(][A-Za-z\-]+[\]\)]'
         matches = re.findall(pattern, source)
         entities.extend([m.strip() for m in matches if m.strip()])
+        print(f"[DEBUG - 实体提取 - 正则后备] 提取结果: {list(set(entities))[:10]}")
         return list(set(entities))[:10]
 
     try:
+        print(f"\n[DEBUG - 实体提取 - 输入文本片段] 准备提取实体的文本 (前200字): {text[:200]}...")
         response = ask_messages(
             model=llm_model,
             temperature=0,
@@ -208,8 +235,13 @@ def _extract_key_entities_from_text(text: str, llm_model: Optional[str] = None) 
             messages=[
                 {
                     "role": "system",
-                    "content": "你是一个学术论文NLP专家。从给定文本中提取最重要的3-8个关键实体（如方法、算法、数据集、技术术语）。"
-                    "请以 JSON 数组形式返回，例如: [\"实体1\", \"实体2\"]。仅返回纯 JSON，不要有其他文本。",
+                    "content": (
+                        "你是一个学术论文NLP专家。从给定文本中提取最重要的3-8个领域关键实体。\n"
+                        "【严格要求】：\n"
+                        "1. 实体必须是专业术语、方法名、模型名(如Transformer)或核心概念。\n"
+                        "2. 绝对不可以提取：时间/年份(如2010)、常见宽泛词汇(如Education, Research, Study, We)。\n"
+                        "3. 请以纯 JSON 字符串数组形式返回，例如: [\"Transformer\", \"Machine Learning\"]。只返回数组，不要包含其他废话。"
+                    ),
                 },
                 {
                     "role": "user",
@@ -218,6 +250,7 @@ def _extract_key_entities_from_text(text: str, llm_model: Optional[str] = None) 
             ]
         )
         content = response.content.strip()
+        print(f"[DEBUG - 实体提取 - LLM回复内容]: {content}")
         # 尝试从 JSON 中解析
         if content.startswith('['):
             entities = json.loads(content)
