@@ -1,8 +1,13 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import ast
-from prompt import TEMPLATE_ANALYSE_PROMPT
+from prompt import (
+    TEMPLATE_ANALYSE_PROMPT,
+    TEMPLATE_BUILD_USER_PROMPT_TEMPLATE,
+    TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE,
+)
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from database import get_db
 from models import Template, User
 from routers.user import get_current_user
@@ -24,7 +29,7 @@ class TemplateRequest(BaseModel):
     icon_path: str = None
 
 def get_template_prompt(description: str) -> str:
-    return f"请根据以下描述生成一个合适的模板：\n\n{description}"
+    return TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE.format(description=description)
 
 
 def extract_first_brace_block(text: str) -> str:
@@ -43,7 +48,10 @@ def build_template(request: str):
     # 构造 Prompt，根据你的模型特性进行微调
     messages = [
         {"role": "system", "content": TEMPLATE_ANALYSE_PROMPT},
-        {"role": "user", "content": "请根据以下摘要内容，提取出一个通用的文本模板，供后续类似内容的快速生成：\n\n摘要内容如下：\n" + request}
+        {
+            "role": "user",
+            "content": TEMPLATE_BUILD_USER_PROMPT_TEMPLATE.format(text=request),
+        }
     ]
 
     try:
@@ -115,4 +123,49 @@ def add_template(information: TemplateRequest, current_user: User = Depends(get_
         raise HTTPException(
             status_code=400,
             detail=f"保存模板失败: {str(e)}"
+        )
+
+
+@router.get("/template/my", status_code=200)
+def get_my_templates(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    获取当前用户可见模板：
+    1. 用户自己的模板（user_id = 当前用户id）
+    2. 公共模板（user_id = 0）
+    """
+    try:
+        templates = (
+            db.query(Template)
+            .filter(or_(Template.user_id == current_user.id, Template.user_id == 0))
+            .order_by(Template.created_at.desc())
+            .all()
+        )
+
+        return {
+            "code": 200,
+            "message": "获取模板成功",
+            "data": [
+                {
+                    "id": template.id,
+                    "user_id": template.user_id,
+                    "name": template.name,
+                    "prompt": template.prompt,
+                    "category": template.category,
+                    "description": template.description,
+                    "example": template.example,
+                    "icon_path": template.icon_path,
+                    "labels": template.labels,
+                    "created_at": template.created_at.isoformat() if template.created_at else None,
+                    "updated_at": template.updated_at.isoformat() if template.updated_at else None,
+                }
+                for template in templates
+            ],
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取模板失败: {str(exc)}",
         )

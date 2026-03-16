@@ -102,7 +102,7 @@ backend/
   - 保存模板到 MySQL（需鉴权）。
 - `src/routers/db_routes.py`
   - 知识库入库、检索、推荐、附件下载接口。
-  - 检索包含跨中英文扩展逻辑（翻译 + WordNet 同义扩展）。
+  - 检索包含基于统一 LLM 接口的中英文查询扩展逻辑。
 - `src/routers/ocr.py`
   - 上传 PDF/图片到 UniParse，返回 Markdown 解析结果。
 - `src/routers/parsing.py`

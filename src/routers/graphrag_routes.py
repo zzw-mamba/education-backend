@@ -32,6 +32,7 @@ class UpsertChunksRequest(BaseModel):
 class SearchRequest(BaseModel):
     query_text: str
     top_k: int = Field(default=5, ge=1, le=30)
+    paper_ids: Optional[List[int]] = Field(default=None, description="限定检索范围的论文 ID 列表")
 
 
 class CreateIndexRequest(BaseModel):
@@ -369,7 +370,11 @@ async def similarity_search(request: SearchRequest):
     """
     service = _service_or_500()
     try:
-        return service.similarity_search(request.query_text, top_k=request.top_k)
+        return service.similarity_search(
+            request.query_text,
+            top_k=request.top_k,
+            paper_ids=request.paper_ids,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -415,6 +420,10 @@ async def rag_search(request: SearchRequest):
     """
     service = _service_or_500()
     try:
-        return service.rag_search(request.query_text, top_k=request.top_k)
+        return service.rag_search(
+            request.query_text,
+            top_k=request.top_k,
+            paper_ids=request.paper_ids,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

@@ -9,6 +9,16 @@ from neo4j import GraphDatabase
 from graphrag.graphrag_config import GraphRAGSettings, get_graphrag_settings
 from database import SessionLocal
 from models import KnowledgeBase
+from prompt import (
+    GRAPHRAG_ENTITY_EXTRACT_SYSTEM_PROMPT,
+    GRAPHRAG_ENTITY_EXTRACT_USER_PROMPT_TEMPLATE,
+    GRAPHRAG_RAG_QA_SYSTEM_PROMPT,
+    GRAPHRAG_RAG_QA_USER_PROMPT_TEMPLATE,
+    GRAPHRAG_SUMMARY_BLOCK_USER_PROMPT_TEMPLATE,
+    GRAPHRAG_SUMMARY_FINAL_USER_PROMPT_TEMPLATE,
+    GRAPHRAG_SUMMARY_SECTION_USER_PROMPT_TEMPLATE,
+    GRAPHRAG_SUMMARY_SYSTEM_PROMPT,
+)
 from utils.model import ask_messages, LLMError
 
 try:
@@ -208,12 +218,11 @@ def _extract_key_entities_from_text(text: str, llm_model: Optional[str] = None) 
             messages=[
                 {
                     "role": "system",
-                    "content": "你是一个学术论文NLP专家。从给定文本中提取最重要的3-8个关键实体（如方法、算法、数据集、技术术语）。"
-                    "请以 JSON 数组形式返回，例如: [\"实体1\", \"实体2\"]。仅返回纯 JSON，不要有其他文本。",
+                    "content": GRAPHRAG_ENTITY_EXTRACT_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",
-                    "content": f"提取关键实体：\n{text[:500]}",
+                    "content": GRAPHRAG_ENTITY_EXTRACT_USER_PROMPT_TEMPLATE.format(text=text[:500]),
                 }
             ]
         )
@@ -363,35 +372,21 @@ class GraphRAGService:
     def _summarize_with_llm(self, context: str, stage: str = "final", section_hint: Optional[str] = None) -> str:
         """基于阶段化提示词调用 LLM 生成局部或最终摘要。"""
         self._ensure_summary_ready()
-        system_prompt = (
-            "你是一个学术论文分析专家，擅长根据知识图谱结构化上下文生成严谨、精炼的中文摘要。"
-            "注意：摘要应按逻辑顺序组织（问题→方法→结果→结论），避免重复和冗余。"
-        )
+        system_prompt = GRAPHRAG_SUMMARY_SYSTEM_PROMPT
 
         if stage == "block":
             section_hint_text = f"当前处理的章节重点：{section_hint}。" if section_hint else ""
-            user_prompt = (
-                f"{section_hint_text}"
-                "以下是论文知识图谱中一组核心实体及上下文。"
-                "请提炼该组信息的局部摘要，聚焦 Problem/Method/Contribution，控制在120字以内。\n\n"
-                f"{context}"
+            user_prompt = GRAPHRAG_SUMMARY_BLOCK_USER_PROMPT_TEMPLATE.format(
+                section_hint_text=section_hint_text,
+                context=context,
             )
         elif stage == "section":
-            user_prompt = (
-                f"以下是论文【{section_hint}】章节的结构化信息。"
-                "请生成该章节的摘要，控制在150字以内，突出该章节的核心贡献：\n\n"
-                f"{context}"
+            user_prompt = GRAPHRAG_SUMMARY_SECTION_USER_PROMPT_TEMPLATE.format(
+                section_hint=section_hint,
+                context=context,
             )
         else:  # final
-            user_prompt = (
-                "以下是从论文知识图谱多轮聚合得到的结构化信息。"
-                "请生成最终学术摘要，要求：\n"
-                "1) 明确核心问题（Problem Statement）\n"
-                "2) 提炼关键方法（Methodology）\n"
-                "3) 总结主要贡献/实验结论（Contribution）\n"
-                "4) 语言专业、精炼、避免重复，中文输出，200-300字。\n\n"
-                f"{context}"
-            )
+            user_prompt = GRAPHRAG_SUMMARY_FINAL_USER_PROMPT_TEMPLATE.format(context=context)
 
         response = ask_messages(
             model=self.settings.llm_model,
@@ -932,16 +927,26 @@ class GraphRAGService:
             db.close()
 
 
-    def similarity_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+    def similarity_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        paper_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
         """基于向量索引执行相似度检索。"""
         self._ensure_embedding_ready()
         query_embedding = self._embed_text(query_text)
         self._validate_query_vector_dimension(query_embedding)
 
+        normalized_paper_ids: Optional[List[int]] = None
+        if paper_ids is not None:
+            normalized_paper_ids = sorted({int(pid) for pid in paper_ids})
+
         query = """
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
         YIELD node, score
-        OPTIONAL MATCH (p:Paper)-[:HAS_CHUNK]->(node)
+        MATCH (p:Paper)-[:HAS_CHUNK]->(node)
+        WHERE $paper_ids IS NULL OR p.paper_id IN $paper_ids
         RETURN
           node.chunk_id AS chunk_id,
           node.text AS text,
@@ -961,6 +966,7 @@ class GraphRAGService:
                         "index_name": self.settings.vector_index_name,
                         "top_k": top_k,
                         "embedding": query_embedding,
+                        "paper_ids": normalized_paper_ids,
                     },
                 )
             )
@@ -980,6 +986,7 @@ class GraphRAGService:
         return {
             "query_text": query_text,
             "top_k": top_k,
+            "paper_ids": normalized_paper_ids,
             "results": response,
         }
 
@@ -1065,6 +1072,7 @@ class GraphRAGService:
                 )
             )
 
+
         return {
             "paper_id": int(source_row["paper_id"]),
             "title": source_row["title"],
@@ -1084,17 +1092,23 @@ class GraphRAGService:
             ],
         }
 
-    def rag_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+    def rag_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        paper_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
         """检索相关 chunks 后调用本地 LLM 生成回答。"""
         self._ensure_ai_ready()
 
         # 1) 向量检索获取上下文
-        search_result = self.similarity_search(query_text, top_k=top_k)
+        search_result = self.similarity_search(query_text, top_k=top_k, paper_ids=paper_ids)
         chunks = search_result.get("results", [])
         if not chunks:
             return {
                 "query_text": query_text,
                 "top_k": top_k,
+                "paper_ids": search_result.get("paper_ids"),
                 "answer": "未找到相关内容。",
                 "context_chunks": [],
             }
@@ -1109,8 +1123,8 @@ class GraphRAGService:
             model=self.settings.llm_model,
             temperature=0,
             messages=[
-                {"role": "system", "content": "你是一个学术论文助手。根据提供的论文片段回答用户问题，回答要准确、有依据。如果片段中没有相关信息，请如实说明。"},
-                {"role": "user", "content": f"参考资料：\n{context}\n\n问题：{query_text}"},
+                {"role": "system", "content": GRAPHRAG_RAG_QA_SYSTEM_PROMPT},
+                {"role": "user", "content": GRAPHRAG_RAG_QA_USER_PROMPT_TEMPLATE.format(context=context, query_text=query_text)},
             ],
         )
         answer = response.content.strip()
@@ -1118,6 +1132,7 @@ class GraphRAGService:
         return {
             "query_text": query_text,
             "top_k": top_k,
+            "paper_ids": search_result.get("paper_ids"),
             "answer": answer,
             "context_chunks": [{"chunk_id": c.get("chunk_id"), "text": c.get("text"), "score": c.get("score")} for c in chunks],
         }
