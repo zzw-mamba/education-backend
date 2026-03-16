@@ -9,16 +9,6 @@ from neo4j import GraphDatabase
 from graphrag.graphrag_config import GraphRAGSettings, get_graphrag_settings
 from database import SessionLocal
 from models import KnowledgeBase
-from prompt import (
-    GRAPHRAG_ENTITY_EXTRACT_SYSTEM_PROMPT,
-    GRAPHRAG_ENTITY_EXTRACT_USER_PROMPT_TEMPLATE,
-    GRAPHRAG_RAG_QA_SYSTEM_PROMPT,
-    GRAPHRAG_RAG_QA_USER_PROMPT_TEMPLATE,
-    GRAPHRAG_SUMMARY_BLOCK_USER_PROMPT_TEMPLATE,
-    GRAPHRAG_SUMMARY_FINAL_USER_PROMPT_TEMPLATE,
-    GRAPHRAG_SUMMARY_SECTION_USER_PROMPT_TEMPLATE,
-    GRAPHRAG_SUMMARY_SYSTEM_PROMPT,
-)
 from utils.model import ask_messages, LLMError
 
 try:
@@ -62,6 +52,22 @@ class LocalEmbeddings:
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """批量嵌入。"""
         return [self.embed_query(t) for t in texts]
+
+
+def _jsonable(value: Any) -> Any:
+    """将任意对象尽可能转换为可 JSON 序列化的结构。"""
+    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    if hasattr(value, "__dict__"):
+        output = {}
+        for k, v in value.__dict__.items():
+            output[k] = _jsonable(v)
+        return output
+    return str(value)
 
 
 def _normalize_section_name(raw_title: str) -> str:
@@ -170,8 +176,38 @@ def _semantic_window_chunks(text: str, chunk_size: int = 600, chunk_overlap: int
     return [c for c in chunks if c]
 
 
+def _optimize_chunk_params_by_language(text: str, default_size: int = 600, default_overlap: int = 90) -> tuple:
+    """根据中英文比例自适应调整切片参数。
+    
+    不同语言的信息密度差异极大：
+    1. 中文（高信息密度）：500字已包含大量核心逻辑推导。如果采用极大的 chunk_size (如1000)，
+       在进行向量相似度检索（Cosine Similarity）时，用户的微小 Query 会被同切片中大量无关内容严重稀释。
+       同时，中文绝大多数学术复合长句均在 80 字以内，overlap=80 已足以保证上下文完全不切断。
+       
+    2. 英文（低信息密度/单词长）：英文单词长度大，长定语从句结构复杂。
+       对于英文文献，1000 个字符往往才能传达一个完整的实验结论片段。
+       如果 overlap 太短（<150），具有 200+ 字符的长句会因为 “不可腰斩” 的强约束机制而被无情完全舍弃，导致图谱断层。
+    """
+    zh_chars = len(re.findall(r'[\u4e00-\u9fa5]', text))
+    total_len = len(text) or 1
+    zh_ratio = zh_chars / total_len
+    
+    # 如果中文占比小（少于 5%），认定为纯英文论文
+    if zh_ratio < 0.05:
+        return 1000, 150 # 英文使用大窗口，高冗余重叠
+    else:
+        return 500, 80   # 中文使用高密度紧凑切分
+
+
 def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_overlap: int = 90) -> List[Dict[str, str]]:
     """先按章节再按语义窗口切片，输出带章节与全局序号的切片。"""
+    
+    # ================= 优化 2：语言自适应计算最佳切片结界 =================
+    adapted_size, adapted_overlap = _optimize_chunk_params_by_language(text, chunk_size, chunk_overlap)
+    print(f"\n[DEBUG - 🌍 语言自适应切片] 检测总体文本度 {len(text)} 字符 -> 动态应用 chunk_size={adapted_size}, chunk_overlap={adapted_overlap}")
+    chunk_size = adapted_size
+    chunk_overlap = adapted_overlap
+
     sections = _split_by_markdown_sections(text)
     if not sections:
         return []
@@ -179,7 +215,7 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
     output: List[Dict[str, str]] = []
     global_index = 0
 
-    # 优化：过滤无用章节 
+    # ================= 优化 1：过滤无用章节 =================
     # 定义需要被丢弃的章节关键词（不区分大小写）
     ignore_keywords = [
         "reference",       # 参考文献 
@@ -221,52 +257,65 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
     return output
 
 
-def _extract_key_entities_from_text(text: str, llm_model: Optional[str] = None) -> List[str]:
+def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> List[Dict[str, str]]:
+    # ================= 优化 3：提取实体->提取关系 =================
     """
-    从文本中提取关键实体。
-    优先使用 LLM 提取（更准确），回落到正则表达式（更快速）。
+    从文本中提取知识图谱三元组 (实体-关系-实体)。
+    优先使用 LLM 提取（包含图谱结构的边），回落到正则表达式（仅提取孤立实体）。
     """
-    # 快速回落：基于大写字母、括号提示的简单启发式方法
-    def _heuristic_extract(source: str) -> List[str]:
-        """使用轻量正则规则从文本中提取候选实体。"""
-        entities = []
+    def _heuristic_extract(source: str) -> List[Dict[str, str]]:
+        """使用轻量正则后备，只提取部分独立实体，无法建立高级关系。"""
         pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*[\[\(][A-Za-z\-]+[\]\)]'
-        matches = re.findall(pattern, source)
-        entities.extend([m.strip() for m in matches if m.strip()])
-        print(f"[DEBUG - 实体提取 - 正则后备] 提取结果: {list(set(entities))[:10]}")
-        return list(set(entities))[:10]
+        matches = list(set([m.strip() for m in re.findall(pattern, source) if m.strip()]))
+        # 把提取到的实体首尾相连造伪关系防止断网，或干脆就不加关系
+        if len(matches) >= 2:
+            return [{"source": matches[0], "target": matches[1], "relation": "RELATED"}]
+        return []
 
     try:
-        print(f"\n[DEBUG - 实体提取 - 输入文本片段] 准备提取实体的文本 (前200字): {text[:200]}...")
+        print(f"\n[DEBUG - 节点关系提取 - 输入文本] 准备提取知识网 (前200字): {text[:200]}...")
         response = ask_messages(
             model=llm_model,
-            temperature=0,
-            max_tokens=256,
+            temperature=0.1,
+            max_tokens=600,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "你是一个学术论文NLP专家。从给定文本中提取最重要的3-8个领域关键实体。\n"
+                        "你是一个高级知识图谱信息抽取专家。请从给定文本中提取核心的知识图谱三元组（实体-关系-实体）。\n"
                         "【严格要求】：\n"
-                        "1. 实体必须是专业术语、方法名、模型名(如Transformer)或核心概念。\n"
-                        "2. 绝对不可以提取：时间/年份(如2010)、常见宽泛词汇(如Education, Research, Study, We)。\n"
-                        "3. 请以纯 JSON 字符串数组形式返回，例如: [\"Transformer\", \"Machine Learning\"]。只返回数组，不要包含其他废话。"
+                        "1. 实体必须是具体的专业术语、方法名、模型或核心研究概念。\n"
+                        "2. 关系必须简短、明确（例如：包含、应用于、提升了、基于、对比）。\n"
+                        "3. 只输出关键的 3-8 个三元组。\n"
+                        "4. 请务必严格以合法的 JSON 对象数组格式返回！要求完全符合如下格式，绝对不要加任何外部注释或 markdown 代码块：\n"
+                        '[{"source": "实体1", "target": "实体2", "relation": "关系描述"}]'
                     ),
                 },
                 {
                     "role": "user",
-                    "content": GRAPHRAG_ENTITY_EXTRACT_USER_PROMPT_TEMPLATE.format(text=text[:500]),
+                    "content": f"提取下面文本的三元字典：\n{text[:1000]}",
                 }
             ]
         )
         content = response.content.strip()
-        print(f"[DEBUG - 实体提取 - LLM回复内容]: {content}")
-        # 尝试从 JSON 中解析
+        # 清理可能存在的 markdown code block
+        content = re.sub(r"^```[a-zA-Z]*\n|```$", "", content, flags=re.MULTILINE).strip()
+        print(f"[DEBUG - 三元组提取 - LLM回复]: {content}")
+        
         if content.startswith('['):
-            entities = json.loads(content)
-            return [str(e).strip() for e in entities if e][:10]
+            triplets = json.loads(content)
+            # 过滤掉不规范的数据
+            valid_triplets = []
+            for t in triplets:
+                if isinstance(t, dict) and "source" in t and "target" in t and "relation" in t:
+                    valid_triplets.append({
+                        "source": str(t["source"]).strip(),
+                        "target": str(t["target"]).strip(),
+                        "relation": str(t["relation"]).strip()
+                    })
+            return valid_triplets[:8]
     except (LLMError, json.JSONDecodeError, Exception) as e:
-        print(f"[GraphRAG] ⚠ LLM 实体提取失败，使用启发式方法: {e}")
+        print(f"[GraphRAG] ⚠ LLM 实体边提取失败，回落到启发式方法: {e}")
 
     return _heuristic_extract(text)
 
@@ -406,21 +455,35 @@ class GraphRAGService:
     def _summarize_with_llm(self, context: str, stage: str = "final", section_hint: Optional[str] = None) -> str:
         """基于阶段化提示词调用 LLM 生成局部或最终摘要。"""
         self._ensure_summary_ready()
-        system_prompt = GRAPHRAG_SUMMARY_SYSTEM_PROMPT
+        system_prompt = (
+            "你是一个学术论文分析专家，擅长根据知识图谱结构化上下文生成严谨、精炼的中文摘要。"
+            "注意：摘要应按逻辑顺序组织（问题→方法→结果→结论），避免重复和冗余。"
+        )
 
         if stage == "block":
             section_hint_text = f"当前处理的章节重点：{section_hint}。" if section_hint else ""
-            user_prompt = GRAPHRAG_SUMMARY_BLOCK_USER_PROMPT_TEMPLATE.format(
-                section_hint_text=section_hint_text,
-                context=context,
+            user_prompt = (
+                f"{section_hint_text}"
+                "以下是论文知识图谱中一组核心实体及上下文。"
+                "请提炼该组信息的局部摘要，聚焦 Problem/Method/Contribution，控制在120字以内。\n\n"
+                f"{context}"
             )
         elif stage == "section":
-            user_prompt = GRAPHRAG_SUMMARY_SECTION_USER_PROMPT_TEMPLATE.format(
-                section_hint=section_hint,
-                context=context,
+            user_prompt = (
+                f"以下是论文【{section_hint}】章节的结构化信息。"
+                "请生成该章节的摘要，控制在150字以内，突出该章节的核心贡献：\n\n"
+                f"{context}"
             )
         else:  # final
-            user_prompt = GRAPHRAG_SUMMARY_FINAL_USER_PROMPT_TEMPLATE.format(context=context)
+            user_prompt = (
+                "以下是从论文知识图谱多轮聚合得到的结构化信息。"
+                "请生成最终学术摘要，要求：\n"
+                "1) 明确核心问题（Problem Statement）\n"
+                "2) 提炼关键方法（Methodology）\n"
+                "3) 总结主要贡献/实验结论（Contribution）\n"
+                "4) 语言专业、精炼、避免重复，中文输出，200-300字。\n\n"
+                f"{context}"
+            )
 
         response = ask_messages(
             model=self.settings.llm_model,
@@ -676,28 +739,16 @@ class GraphRAGService:
         with self.driver.session() as session:
             rows = list(
                 session.run(
-                    "SHOW VECTOR INDEXES YIELD name, options WHERE name = $name RETURN name, options",
+                    "SHOW VECTOR INDEXES YIELD name WHERE name = $name RETURN name",
                     {"name": self.settings.vector_index_name},
                 )
             )
 
             exists = len(rows) > 0
-            existing_dimension = None
-            if exists:
-                options = rows[0].get("options") or {}
-                index_config = options.get("indexConfig") or {}
-                existing_dimension = index_config.get("vector.dimensions")
 
             if exists and force_recreate:
                 session.run(f"DROP INDEX {self.settings.vector_index_name} IF EXISTS")
                 exists = False
-            elif exists and existing_dimension not in (None, self.settings.embedding_dimensions):
-                raise RuntimeError(
-                    f"向量索引 {self.settings.vector_index_name} 的维度为 {existing_dimension}，"
-                    f"但当前配置 GRAPHRAG_EMBEDDING_DIMENSIONS={self.settings.embedding_dimensions}。"
-                    "请调用 /api/graphrag/create-index 并传 force_recreate=true，"
-                    "然后重新执行 /api/graphrag/sync-from-mysql 以重建向量索引和 embedding 数据。"
-                )
 
         if not exists:
             create_vector_index(
@@ -711,44 +762,6 @@ class GraphRAGService:
             return {"created": True, "index_name": self.settings.vector_index_name}
 
         return {"created": False, "index_name": self.settings.vector_index_name}
-
-    def _get_vector_index_dimension(self) -> Optional[int]:
-        """读取当前向量索引的配置维度。"""
-        self._ensure_initialized()
-
-        with self.driver.session() as session:
-            row = session.run(
-                "SHOW VECTOR INDEXES YIELD name, options WHERE name = $name RETURN options",
-                {"name": self.settings.vector_index_name},
-            ).single()
-
-        if not row:
-            return None
-
-        options = row.get("options") or {}
-        index_config = options.get("indexConfig") or {}
-        return index_config.get("vector.dimensions")
-
-    def _validate_query_vector_dimension(self, vector: List[float]) -> int:
-        """校验查询向量维度与向量索引维度一致。"""
-        actual_dimension = len(vector)
-        index_dimension = self._get_vector_index_dimension()
-
-        if index_dimension is None:
-            raise RuntimeError(
-                f"向量索引 {self.settings.vector_index_name} 不存在，请先调用 /api/graphrag/create-index 创建索引。"
-            )
-
-        if actual_dimension != index_dimension:
-            raise RuntimeError(
-                f"向量维度不匹配：索引 {self.settings.vector_index_name} 维度为 {index_dimension}，"
-                f"当前向量维度为 {actual_dimension}。"
-                "这通常表示 embedding 模型已切换但索引未重建。"
-                "请调用 /api/graphrag/create-index 并传 force_recreate=true，"
-                "然后重新执行 /api/graphrag/sync-from-mysql。"
-            )
-
-        return index_dimension
 
     def upsert_paper_chunks(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         """写入论文切片、实体关系与结构化关联边。"""
@@ -768,14 +781,22 @@ class GraphRAGService:
             section_name = str(row.get("section_name") or "Body")
             key_entities = row.get("key_entities") or []
             entities = row.get("entities") or []
+            relations = row.get("relations") or []
 
             if paper_id is None or not chunk_id or not text:
                 continue
 
-            # 如果未提供实体，尝试从文本中自动提取
-            if not entities:
-                extracted_entity_names = _extract_key_entities_from_text(text, self.settings.llm_model)
-                entities = [{"name": name, "type": "Concept"} for name in extracted_entity_names]
+            # 如果未提供实体且未提供关系，尝试从文本中自动提取三元组
+            if not entities and not relations:
+                extracted_triplets = _extract_triplets_from_text(text, self.settings.llm_model)
+                relations = extracted_triplets
+                
+                # 从三元组中归纳出所有去重的实体节点
+                entity_set = set()
+                for trip in extracted_triplets:
+                    entity_set.add(trip["source"])
+                    entity_set.add(trip["target"])
+                entities = [{"name": name, "type": "Concept"} for name in entity_set]
 
             normalized_entities = []
             for entity in entities:
@@ -804,6 +825,7 @@ class GraphRAGService:
                     "section_name": section_name,
                     "key_entities": key_entities,
                     "entities": normalized_entities,
+                    "relations": relations,
                 }
             )
 
@@ -835,6 +857,12 @@ class GraphRAGService:
             MERGE (e:Entity {name: ent.name, type: ent.type})
             MERGE (c)-[:MENTIONS]->(e)
             MERGE (p)-[:HAS_ENTITY]->(e)
+        )
+        
+        FOREACH (rel IN coalesce(row.relations, []) |
+            MERGE (e1:Entity {name: rel.source, type: 'Concept'})
+            MERGE (e2:Entity {name: rel.target, type: 'Concept'})
+            MERGE (e1)-[r:RELATED_TO {relation: rel.relation}]->(e2)
         )
 
         RETURN count(c) AS count
@@ -921,16 +949,21 @@ class GraphRAGService:
                 for chunk_item in hierarchical_chunks:
                     chunk_text = chunk_item["chunk_text"]
                     
-                    # 自动从切片提取实体，与标签合并
+                    # 自动从切片提取三元组，并将其节点合并为实体标签
                     chunk_entities = paper_entities.copy()
+                    chunk_relations = []
                     if auto_extract_entities:
                         try:
-                            extracted_names = _extract_key_entities_from_text(chunk_text, self.settings.llm_model)
-                            for name in extracted_names:
-                                if not any(e["name"] == name for e in chunk_entities):
-                                    chunk_entities.append({"name": name, "type": "Concept"})
+                            extracted_triplets = _extract_triplets_from_text(chunk_text, self.settings.llm_model)
+                            chunk_relations = extracted_triplets
+                            
+                            # 将三元组中的所有节点也打平放入 entities 列表中
+                            for t in extracted_triplets:
+                                for en in [t["source"], t["target"]]:
+                                    if not any(e["name"] == en for e in chunk_entities):
+                                        chunk_entities.append({"name": en, "type": "Concept"})
                         except Exception as e:
-                            print(f"[GraphRAG] ⚠ 自动实体提取失败: {e}")
+                            print(f"[GraphRAG] ⚠ 自动三元组提取失败: {e}")
                     
                     rows.append(
                         {
@@ -943,6 +976,7 @@ class GraphRAGService:
                             "section_name": chunk_item["section_name"],
                             "key_entities": key_entities,
                             "entities": chunk_entities,
+                            "relations": chunk_relations,
                         }
                     )
 
@@ -960,27 +994,63 @@ class GraphRAGService:
         finally:
             db.close()
 
-
-    def similarity_search(
+    def chunk_and_store_from_mysql(
         self,
-        query_text: str,
-        top_k: int = 5,
         paper_ids: Optional[List[int]] = None,
+        limit: int = 100,
+        chunk_size: int = 800,
+        chunk_overlap: int = 120,
+        auto_extract_entities: bool = True,
     ) -> Dict[str, Any]:
+        """同步接口别名：分块后写入 Neo4j。"""
+        return self.sync_from_mysql_knowledge_base(
+            paper_ids=paper_ids,
+            limit=limit,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            auto_extract_entities=auto_extract_entities,
+        )
+
+    def upsert_chunks(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """将外部传入的切片列表标准化并批量写入图数据库。"""
+        self._ensure_embedding_ready()
+        rows = []
+        for i, chunk in enumerate(chunks):
+            chunk_id = str(chunk.get("id") or chunk.get("chunk_id") or "").strip()
+            text = str(chunk.get("text") or "").strip()
+            paper_id = chunk.get("paper_id", -1)
+            title = chunk.get("title", "Adhoc Paper")
+            year = chunk.get("year")
+            index = chunk.get("index", i)
+            section_name = chunk.get("section_name", "Body")
+            key_entities = chunk.get("key_entities") or []
+            entities = chunk.get("entities") or []
+            if chunk_id and text:
+                rows.append(
+                    {
+                        "paper_id": int(paper_id),
+                        "title": title,
+                        "year": year,
+                        "chunk_id": chunk_id,
+                        "text": text,
+                        "index": index,
+                        "section_name": section_name,
+                        "key_entities": key_entities,
+                        "entities": entities,
+                    }
+                )
+        self.ensure_vector_index(force_recreate=False)
+        return self.upsert_paper_chunks(rows)
+
+    def similarity_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
         """基于向量索引执行相似度检索。"""
         self._ensure_embedding_ready()
         query_embedding = self._embed_text(query_text)
-        self._validate_query_vector_dimension(query_embedding)
-
-        normalized_paper_ids: Optional[List[int]] = None
-        if paper_ids is not None:
-            normalized_paper_ids = sorted({int(pid) for pid in paper_ids})
 
         query = """
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
         YIELD node, score
-        MATCH (p:Paper)-[:HAS_CHUNK]->(node)
-        WHERE $paper_ids IS NULL OR p.paper_id IN $paper_ids
+        OPTIONAL MATCH (p:Paper)-[:HAS_CHUNK]->(node)
         RETURN
           node.chunk_id AS chunk_id,
           node.text AS text,
@@ -1000,7 +1070,6 @@ class GraphRAGService:
                         "index_name": self.settings.vector_index_name,
                         "top_k": top_k,
                         "embedding": query_embedding,
-                        "paper_ids": normalized_paper_ids,
                     },
                 )
             )
@@ -1020,129 +1089,20 @@ class GraphRAGService:
         return {
             "query_text": query_text,
             "top_k": top_k,
-            "paper_ids": normalized_paper_ids,
             "results": response,
         }
 
-    def related_papers_by_id(
-        self,
-        paper_id: int,
-        top_k: int = 10,
-        per_chunk_k: int = 8,
-        source_chunk_limit: int = 8,
-        evidence_limit: int = 3,
-    ) -> Dict[str, Any]:
-        """给定论文 ID，基于 Chunk 向量相似度聚合召回相关文章。"""
-        self._ensure_embedding_ready()
-        with self.driver.session() as session:
-            source_row = session.run(
-                """
-                MATCH (p:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(c:Chunk)
-                RETURN p.paper_id AS paper_id, p.title AS title, count(c) AS chunk_count
-                """,
-                {"paper_id": int(paper_id)},
-            ).single()
-
-            if not source_row:
-                raise ValueError(f"论文 {paper_id} 尚未同步到 GraphRAG 图数据库")
-
-            sample_chunk = session.run(
-                """
-                MATCH (:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(c:Chunk)
-                WHERE c.embedding IS NOT NULL
-                RETURN c.embedding AS embedding
-                LIMIT 1
-                """,
-                {"paper_id": int(paper_id)},
-            ).single()
-
-            if not sample_chunk or not sample_chunk.get("embedding"):
-                raise ValueError(f"论文 {paper_id} 缺少可用的 embedding，请先重新同步到 GraphRAG")
-
-            self._validate_query_vector_dimension(sample_chunk["embedding"])
-
-            rows = list(
-                session.run(
-                    """
-                    MATCH (source:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(source_chunk:Chunk)
-                    WHERE source_chunk.embedding IS NOT NULL
-                    WITH source, collect(source_chunk)[0..$source_chunk_limit] AS source_chunks
-                    UNWIND source_chunks AS source_chunk
-                    CALL db.index.vector.queryNodes($index_name, $per_chunk_k, source_chunk.embedding)
-                    YIELD node, score
-                    MATCH (candidate:Paper)-[:HAS_CHUNK]->(node)
-                    WHERE candidate.paper_id <> $paper_id
-                    WITH source, candidate,
-                         collect(DISTINCT {
-                            source_chunk_id: source_chunk.chunk_id,
-                            matched_chunk_id: node.chunk_id,
-                            score: score,
-                            text: substring(coalesce(node.text, ''), 0, 180)
-                         }) AS evidence,
-                         max(score) AS max_score,
-                         avg(score) AS avg_score,
-                         count(DISTINCT node) AS matched_chunks
-                    RETURN
-                      source.paper_id AS source_paper_id,
-                      source.title AS source_title,
-                      candidate.paper_id AS paper_id,
-                      candidate.title AS title,
-                      candidate.year AS year,
-                      max_score,
-                      avg_score,
-                      matched_chunks,
-                      evidence[0..$evidence_limit] AS evidence
-                    ORDER BY avg_score DESC, matched_chunks DESC, max_score DESC
-                    LIMIT $top_k
-                    """,
-                    {
-                        "paper_id": int(paper_id),
-                        "index_name": self.settings.vector_index_name,
-                        "top_k": int(top_k),
-                        "per_chunk_k": int(per_chunk_k),
-                        "source_chunk_limit": int(source_chunk_limit),
-                        "evidence_limit": int(evidence_limit),
-                    },
-                )
-            )
-
-
-        return {
-            "paper_id": int(source_row["paper_id"]),
-            "title": source_row["title"],
-            "source_chunk_count": source_row["chunk_count"],
-            "top_k": int(top_k),
-            "results": [
-                {
-                    "paper_id": row["paper_id"],
-                    "title": row["title"],
-                    "year": row["year"],
-                    "max_score": row["max_score"],
-                    "avg_score": row["avg_score"],
-                    "matched_chunks": row["matched_chunks"],
-                    "evidence": row["evidence"],
-                }
-                for row in rows
-            ],
-        }
-
-    def rag_search(
-        self,
-        query_text: str,
-        top_k: int = 5,
-        paper_ids: Optional[List[int]] = None,
-    ) -> Dict[str, Any]:
+    def rag_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
         """检索相关 chunks 后调用本地 LLM 生成回答。"""
         self._ensure_ai_ready()
 
         # 1) 向量检索获取上下文
-        search_result = self.similarity_search(query_text, top_k=top_k, paper_ids=paper_ids)
+        search_result = self.similarity_search(query_text, top_k=top_k)
         chunks = search_result.get("results", [])
         if not chunks:
             return {
                 "query_text": query_text,
                 "top_k": top_k,
-                "paper_ids": search_result.get("paper_ids"),
                 "answer": "未找到相关内容。",
                 "context_chunks": [],
             }
@@ -1157,8 +1117,8 @@ class GraphRAGService:
             model=self.settings.llm_model,
             temperature=0,
             messages=[
-                {"role": "system", "content": GRAPHRAG_RAG_QA_SYSTEM_PROMPT},
-                {"role": "user", "content": GRAPHRAG_RAG_QA_USER_PROMPT_TEMPLATE.format(context=context, query_text=query_text)},
+                {"role": "system", "content": "你是一个学术论文助手。根据提供的论文片段回答用户问题，回答要准确、有依据。如果片段中没有相关信息，请如实说明。"},
+                {"role": "user", "content": f"参考资料：\n{context}\n\n问题：{query_text}"},
             ],
         )
         answer = response.content.strip()
@@ -1166,7 +1126,6 @@ class GraphRAGService:
         return {
             "query_text": query_text,
             "top_k": top_k,
-            "paper_ids": search_result.get("paper_ids"),
             "answer": answer,
             "context_chunks": [{"chunk_id": c.get("chunk_id"), "text": c.get("text"), "score": c.get("score")} for c in chunks],
         }
