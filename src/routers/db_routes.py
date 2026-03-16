@@ -1,4 +1,5 @@
 import jieba.analyse
+import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -8,11 +9,65 @@ import os
 
 from database import get_db
 import models
-from deep_translator import GoogleTranslator
-from nltk.corpus import wordnet
 import re
+from prompt import (
+    KNOWLEDGE_SEARCH_EXPANSION_SYSTEM_PROMPT,
+    KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE,
+)
+from utils.model import ask_messages, LLMError
 
 router = APIRouter(tags=["Database"])
+
+
+def _extract_first_json_array(text: str) -> str:
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or start >= end:
+        return text
+    return text[start:end + 1]
+
+
+def _normalize_search_term(term: str) -> str:
+    return re.sub(r"\s+", " ", term).strip().strip('"')
+
+
+def _expand_search_terms_with_llm(query: str) -> List[str]:
+    normalized_query = query.strip()
+    if not normalized_query:
+        return []
+
+    terms = {normalized_query}
+    try:
+        llm_result = ask_messages(
+            messages=[
+                {"role": "system", "content": KNOWLEDGE_SEARCH_EXPANSION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE.format(query=normalized_query),
+                },
+            ],
+            max_tokens=256,
+            temperature=0.2,
+            top_p=0.9,
+            extra_payload={
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        content = _extract_first_json_array((llm_result.content or "").strip())
+        candidates = json.loads(content)
+        if isinstance(candidates, list):
+            for item in candidates:
+                if not isinstance(item, str):
+                    continue
+                normalized_term = _normalize_search_term(item)
+                if normalized_term:
+                    terms.add(normalized_term)
+    except (LLMError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    return list(terms)[:8]
 
 # --- 1. 测试连接 (保留并增强) ---
 @router.get("/db-test")
@@ -71,39 +126,12 @@ def add_knowledge_entry(
 
 @router.get("/knowledge/search")
 def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
-    def get_wordnet_expansions(word_en):
-        synonyms = []
-        for syn in wordnet.synsets(word_en)[:2]:
-            for lemma in syn.lemmas():
-                synonyms.append(lemma.name().replace('_', ' '))
-        return list(set(synonyms))[:5]
-
-    def expand_search_terms(q: str):
-        terms = {q.strip()}
-        try:
-            if re.search(r'[\u4e00-\u9fa5]', q):
-                translated = GoogleTranslator(source='zh-CN', target='en').translate(q)
-                print(translated)
-                for w in get_wordnet_expansions(translated):
-                    terms.add(w)
-
-            else:
-                translated = GoogleTranslator(source='en', target='zh-CN').translate(q)
-                for w in get_wordnet_expansions(q):
-                    terms.add(w)
-
-            terms.add(translated.strip())
-        except:
-            pass
-
-        return list(terms)
-    
-    search_terms = expand_search_terms(q)
-    print(search_terms)
+    search_terms = _expand_search_terms_with_llm(q)
     search_payload = " ".join([f'"{term}"' for term in search_terms])
+    print(f"Expanded search terms: {search_terms}, payload: {search_payload}")
 
     sql = text("""
-        SELECT id, title, authors, year,
+        SELECT id, title, authors, year, content,
             (
                 (MATCH(title) AGAINST(:payload IN BOOLEAN MODE) * 5) + 
                 (MATCH(content) AGAINST(:payload IN BOOLEAN MODE) * 1)
@@ -122,7 +150,8 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
             "title": r.title, 
             "score": round(r.score, 2),
             "authors": r.authors,
-            "year": r.year
+            "year": r.year,
+            "content": r.content[:200]  # 返回内容的前200字符作为预览
         } for r in result
     ]
 
@@ -183,6 +212,21 @@ def recommend_similar_by_tags(
         }
         for row in result
     ]
+
+
+@router.get("/knowledge/content/{kb_id}")
+def get_knowledge_content(kb_id: int, db: Session = Depends(get_db)):
+    kb_entry = db.query(models.KnowledgeBase).filter(models.KnowledgeBase.id == kb_id).first()
+    if not kb_entry:
+        raise HTTPException(status_code=404, detail="Knowledge entry not found")
+
+    return {
+        "id": kb_entry.id,
+        "title": kb_entry.title,
+        "authors": kb_entry.authors,
+        "year": kb_entry.year,
+        "content": kb_entry.content,
+    }
 
 @router.get("/knowledge/file/{file_id}")
 def get_knowledge_file(file_id: int, db: Session = Depends(get_db)):
