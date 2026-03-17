@@ -33,8 +33,6 @@ class SearchRequest(BaseModel):
     query_text: str
     top_k: int = Field(default=5, ge=1, le=30)
     paper_ids: Optional[List[int]] = Field(default=None, description="限定检索范围的论文 ID 列表")
-    semantic_expand: bool = Field(default=True, description="是否启用基于本体关系的语义扩展召回")
-    expansion_hops: int = Field(default=1, ge=1, le=2, description="语义图扩展跳数")
 
 
 class CreateIndexRequest(BaseModel):
@@ -47,7 +45,6 @@ class SyncFromMySQLRequest(BaseModel):
     chunk_size: int = Field(default=800, ge=100, le=4000)
     chunk_overlap: int = Field(default=120, ge=0, le=1000)
     auto_extract_entities: bool = Field(default=True, description="是否自动抽取实体并构建 MENTIONS 关系")
-    auto_link_to_ontology: bool = Field(default=True, description="是否自动将实体锚定到受控词表 Concept")
 
 
 class SetupLocalDBRequest(BaseModel):
@@ -59,7 +56,6 @@ class SetupLocalDBRequest(BaseModel):
     chunk_size: int = Field(default=800, ge=100, le=4000)
     chunk_overlap: int = Field(default=120, ge=0, le=1000)
     auto_extract_entities: bool = Field(default=True, description="同步时是否自动抽取实体")
-    auto_link_to_ontology: bool = Field(default=True, description="同步时是否自动执行实体链接")
 
 
 class PaperSummaryRequest(BaseModel):
@@ -216,7 +212,6 @@ async def setup_local_db(request: SetupLocalDBRequest):
                 chunk_size=request.chunk_size,
                 chunk_overlap=request.chunk_overlap,
                 auto_extract_entities=request.auto_extract_entities,
-                auto_link_to_ontology=request.auto_link_to_ontology,
             )
 
         return {
@@ -298,7 +293,6 @@ async def sync_from_mysql(request: SyncFromMySQLRequest):
             chunk_size=request.chunk_size,
             chunk_overlap=request.chunk_overlap,
             auto_extract_entities=request.auto_extract_entities,
-            auto_link_to_ontology=request.auto_link_to_ontology,
         )
         return {"success": True, **result}
     except Exception as e:
@@ -380,8 +374,6 @@ async def similarity_search(request: SearchRequest):
             request.query_text,
             top_k=request.top_k,
             paper_ids=request.paper_ids,
-            semantic_expand=request.semantic_expand,
-            expansion_hops=request.expansion_hops,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -432,8 +424,6 @@ async def rag_search(request: SearchRequest):
             request.query_text,
             top_k=request.top_k,
             paper_ids=request.paper_ids,
-            semantic_expand=request.semantic_expand,
-            expansion_hops=request.expansion_hops,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
