@@ -1,5 +1,4 @@
 **/__pycache__/
-/routers/__pycache__/
 
 /template_json
 /analysis_results
@@ -8,5 +7,4 @@
 /uploaded_files
 /bibs
 /ocr_output
-
 .env
