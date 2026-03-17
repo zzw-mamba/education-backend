@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import requests
 import re
 import json
@@ -320,6 +320,137 @@ def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> L
     return _heuristic_extract(text)
 
 
+def _normalize_entity_phrase(value: str) -> str:
+    """归一化短语，便于做别名对齐与实体链接。"""
+    source = (value or "").strip().lower()
+    return re.sub(r"[\s_\-]+", "", source)
+
+
+def _default_schema_org_seed() -> List[Dict[str, Any]]:
+    """最小可用的 Schema.org 风格受控词表。"""
+    return [
+        {
+            "uri": "https://schema.org/Thing",
+            "name": "Thing",
+            "description": "最顶层概念",
+            "aliases": ["thing", "概念"],
+            "parents": [],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/CreativeWork",
+            "name": "CreativeWork",
+            "description": "创作作品",
+            "aliases": ["creativework", "作品", "文档"],
+            "parents": ["https://schema.org/Thing"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/ScholarlyArticle",
+            "name": "ScholarlyArticle",
+            "description": "学术论文",
+            "aliases": ["paper", "article", "学术论文", "论文"],
+            "parents": ["https://schema.org/CreativeWork"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/DefinedTerm",
+            "name": "DefinedTerm",
+            "description": "标准术语",
+            "aliases": ["definedterm", "术语", "标准术语"],
+            "parents": ["https://schema.org/Thing"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/Algorithm",
+            "name": "Algorithm",
+            "description": "算法",
+            "aliases": ["algorithm", "算法", "模型算法"],
+            "parents": ["https://schema.org/DefinedTerm"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/NeuralNetwork",
+            "name": "NeuralNetwork",
+            "description": "神经网络",
+            "aliases": ["neural network", "神经网络", "nn"],
+            "parents": ["https://schema.org/Algorithm"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/TransformerModel",
+            "name": "TransformerModel",
+            "description": "Transformer 架构",
+            "aliases": ["transformer", "transformer model", "变换器模型", "transformer架构"],
+            "parents": ["https://schema.org/NeuralNetwork"],
+            "related": ["https://schema.org/ConvolutionalNeuralNetwork"],
+        },
+        {
+            "uri": "https://schema.org/ConvolutionalNeuralNetwork",
+            "name": "ConvolutionalNeuralNetwork",
+            "description": "卷积神经网络",
+            "aliases": ["cnn", "convolutional neural network", "卷积神经网络"],
+            "parents": ["https://schema.org/NeuralNetwork"],
+            "related": ["https://schema.org/TransformerModel"],
+        },
+        {
+            "uri": "https://schema.org/Dataset",
+            "name": "Dataset",
+            "description": "数据集",
+            "aliases": ["dataset", "benchmark", "数据集", "基准数据集"],
+            "parents": ["https://schema.org/CreativeWork"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/PropertyValue",
+            "name": "EvaluationMetric",
+            "description": "评价指标",
+            "aliases": ["metric", "evaluation metric", "评价指标", "评估指标"],
+            "parents": ["https://schema.org/DefinedTerm"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/ChemicalSubstance",
+            "name": "ChemicalSubstance",
+            "description": "化学物质",
+            "aliases": ["chemical", "chemical substance", "化学物质", "材料"],
+            "parents": ["https://schema.org/Thing"],
+            "related": [],
+        },
+        {
+            "uri": "https://schema.org/TherapeuticProcedure",
+            "name": "TherapeuticProcedure",
+            "description": "治疗手段",
+            "aliases": ["treatment", "therapy", "治疗手段", "治疗方法"],
+            "parents": ["https://schema.org/DefinedTerm"],
+            "related": [],
+        },
+    ]
+
+
+def _build_alias_to_concept_index(concepts: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """构建别名到 Concept 的映射索引。"""
+    alias_index: Dict[str, Dict[str, str]] = {}
+    for concept in concepts:
+        concept_uri = str(concept.get("uri") or "").strip()
+        concept_name = str(concept.get("name") or "").strip()
+        if not concept_uri:
+            continue
+
+        aliases = list(concept.get("aliases") or [])
+        aliases.extend([concept_name, concept_uri.rsplit("/", 1)[-1]])
+        for alias in aliases:
+            normalized = _normalize_entity_phrase(str(alias))
+            if not normalized:
+                continue
+            alias_index[normalized] = {
+                "uri": concept_uri,
+                "name": concept_name,
+                "matched_alias": str(alias),
+            }
+    return alias_index
+
+
 class GraphRAGService:
     def __init__(self, settings: Optional[GraphRAGSettings] = None):
         """初始化 GraphRAG 服务实例与运行时状态。"""
@@ -327,6 +458,8 @@ class GraphRAGService:
         self.driver = None
         self.embedder = None
         self.retriever = None
+        self.ontology_seed = _default_schema_org_seed()
+        self.alias_to_concept = _build_alias_to_concept_index(self.ontology_seed)
         # 章节权重：不同章节对摘要的重要性权重
         self.section_weights = {
             "Abstract": 0.0,      # 摘要本身不编入权重计算
@@ -335,6 +468,138 @@ class GraphRAGService:
             "Experiments": 0.35,   # 实验结果同样重要
             "Conclusion": 0.15,    # 结论和展望
             "Body": 0.10           # 其他内容权重较低
+        }
+
+    def _link_entity_to_concept(self, entity_name: str) -> Optional[Dict[str, Any]]:
+        """将自由实体通过受控词表映射到标准 Concept。"""
+        normalized = _normalize_entity_phrase(entity_name)
+        if not normalized:
+            return None
+
+        direct = self.alias_to_concept.get(normalized)
+        if direct:
+            return {
+                "concept_uri": direct["uri"],
+                "concept_name": direct["name"],
+                "matched_alias": direct["matched_alias"],
+                "link_confidence": 0.95,
+            }
+
+        # 简单模糊回退：别名包含或被包含
+        for alias_norm, concept in self.alias_to_concept.items():
+            if alias_norm in normalized or normalized in alias_norm:
+                return {
+                    "concept_uri": concept["uri"],
+                    "concept_name": concept["name"],
+                    "matched_alias": concept["matched_alias"],
+                    "link_confidence": 0.75,
+                }
+        return None
+
+    def _extract_query_tokens(self, query_text: str) -> List[str]:
+        """提取查询中的可链接 token。"""
+        tokens = re.findall(r"[A-Za-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", (query_text or ""))
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for token in tokens:
+            norm = _normalize_entity_phrase(token)
+            if norm and norm not in seen:
+                seen.add(norm)
+                ordered.append(token)
+        return ordered
+
+    def _expand_concept_uris(self, seed_uris: List[str], max_hops: int = 1, max_size: int = 30) -> List[str]:
+        """基于本体关系扩展 Concept 集合。"""
+        if not seed_uris:
+            return []
+        self._ensure_initialized()
+
+        hop = 1 if max_hops <= 1 else 2
+        query = """
+        MATCH (c:Concept)
+        WHERE c.uri IN $seed_uris
+        OPTIONAL MATCH path = (c)-[:IS_A|RELATED_TO_SEMANTIC*1..2]-(nbr:Concept)
+        WHERE length(path) <= $hop
+        WITH collect(DISTINCT c.uri) + collect(DISTINCT nbr.uri) AS uris
+        UNWIND uris AS uri
+        WITH DISTINCT uri WHERE uri IS NOT NULL
+        RETURN uri
+        LIMIT $limit
+        """
+        with self.driver.session() as session:
+            rows = list(
+                session.run(
+                    query,
+                    {
+                        "seed_uris": seed_uris,
+                        "hop": hop,
+                        "limit": max(1, int(max_size)),
+                    },
+                )
+            )
+        return [r["uri"] for r in rows if r.get("uri")]
+
+    def upsert_controlled_vocabulary(self, concepts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """写入标准本体概念与语义关系（幂等）。"""
+        self._ensure_initialized()
+        rows = concepts or self.ontology_seed
+        if not rows:
+            return {"concepts": 0, "relations": 0}
+
+        concept_query = """
+        UNWIND $rows AS row
+        MERGE (c:Concept {uri: row.uri})
+        SET c.name = row.name,
+            c.description = row.description,
+            c.aliases = coalesce(row.aliases, []),
+            c.source = coalesce(row.source, 'schema.org'),
+            c.updated_at = datetime()
+        RETURN count(c) AS count
+        """
+
+        relation_query = """
+        UNWIND $rows AS row
+        MATCH (c:Concept {uri: row.uri})
+        FOREACH (p_uri IN coalesce(row.parents, []) |
+            MERGE (p:Concept {uri: p_uri})
+            ON CREATE SET p.name = p_uri, p.source = coalesce(row.source, 'schema.org')
+            MERGE (c)-[:IS_A]->(p)
+        )
+        FOREACH (r_uri IN coalesce(row.related, []) |
+            MERGE (r:Concept {uri: r_uri})
+            ON CREATE SET r.name = r_uri, r.source = coalesce(row.source, 'schema.org')
+            MERGE (c)-[:RELATED_TO_SEMANTIC]->(r)
+        )
+        RETURN count(c) AS count
+        """
+
+        normalized_rows = []
+        for row in rows:
+            uri = str(row.get("uri") or "").strip()
+            if not uri:
+                continue
+            normalized_rows.append(
+                {
+                    "uri": uri,
+                    "name": str(row.get("name") or uri.rsplit("/", 1)[-1]).strip(),
+                    "description": str(row.get("description") or "").strip(),
+                    "aliases": [str(v).strip() for v in (row.get("aliases") or []) if str(v).strip()],
+                    "parents": [str(v).strip() for v in (row.get("parents") or []) if str(v).strip()],
+                    "related": [str(v).strip() for v in (row.get("related") or []) if str(v).strip()],
+                    "source": str(row.get("source") or "schema.org").strip(),
+                }
+            )
+
+        if not normalized_rows:
+            return {"concepts": 0, "relations": 0}
+
+        with self.driver.session() as session:
+            concept_result = session.run(concept_query, {"rows": normalized_rows}).single()
+            relation_result = session.run(relation_query, {"rows": normalized_rows}).single()
+
+        return {
+            "concepts": int(concept_result["count"]) if concept_result else 0,
+            "relations": int(relation_result["count"]) if relation_result else 0,
         }
 
     def _has_local_embedding(self) -> bool:
@@ -695,6 +960,7 @@ class GraphRAGService:
         """准备本地图数据库环境并返回当前统计信息。"""
         self._ensure_initialized()
         schema_result = self.ensure_graph_schema()
+        ontology_result = self.upsert_controlled_vocabulary()
         index_result = {"created": False, "index_name": self.settings.vector_index_name}
         if create_vector_index:
             index_result = self.ensure_vector_index(force_recreate=force_recreate_index)
@@ -703,14 +969,21 @@ class GraphRAGService:
             paper_count = session.run("MATCH (p:Paper) RETURN count(p) AS c").single()["c"]
             chunk_count = session.run("MATCH (c:Chunk) RETURN count(c) AS c").single()["c"]
             entity_count = session.run("MATCH (e:Entity) RETURN count(e) AS c").single()["c"]
+            concept_count = session.run("MATCH (c:Concept) RETURN count(c) AS c").single()["c"]
+            linked_entity_count = session.run(
+                "MATCH (:Entity)-[:LINKED_TO_CONCEPT]->(:Concept) RETURN count(*) AS c"
+            ).single()["c"]
 
         return {
             "schema_ready": schema_result.get("schema_ready", False),
+            "ontology": ontology_result,
             "vector_index": index_result,
             "counts": {
                 "paper": paper_count,
                 "chunk": chunk_count,
                 "entity": entity_count,
+                "concept": concept_count,
+                "entity_concept_links": linked_entity_count,
             },
         }
 
@@ -722,7 +995,10 @@ class GraphRAGService:
             "CREATE CONSTRAINT paper_paper_id_unique IF NOT EXISTS FOR (p:Paper) REQUIRE p.paper_id IS UNIQUE",
             "CREATE CONSTRAINT chunk_chunk_id_unique IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
             "CREATE CONSTRAINT entity_name_type_unique IF NOT EXISTS FOR (e:Entity) REQUIRE (e.name, e.type) IS UNIQUE",
+            "CREATE CONSTRAINT concept_uri_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.uri IS UNIQUE",
             "CREATE INDEX paper_year_index IF NOT EXISTS FOR (p:Paper) ON (p.year)",
+            "CREATE INDEX concept_name_index IF NOT EXISTS FOR (c:Concept) ON (c.name)",
+            "CREATE INDEX entity_normalized_name_index IF NOT EXISTS FOR (e:Entity) ON (e.normalized_name)",
         ]
 
         with self.driver.session() as session:
@@ -803,10 +1079,16 @@ class GraphRAGService:
                 entity_name = str(entity.get("name") or "").strip()
                 if not entity_name:
                     continue
+                linked = self._link_entity_to_concept(entity_name)
                 normalized_entities.append(
                     {
                         "name": entity_name,
                         "type": str(entity.get("type") or "Unknown").strip() or "Unknown",
+                        "normalized_name": _normalize_entity_phrase(entity_name),
+                        "concept_uri": linked.get("concept_uri") if linked else None,
+                        "concept_name": linked.get("concept_name") if linked else None,
+                        "matched_alias": linked.get("matched_alias") if linked else None,
+                        "link_confidence": linked.get("link_confidence") if linked else None,
                     }
                 )
 
@@ -855,8 +1137,20 @@ class GraphRAGService:
 
         FOREACH (ent IN coalesce(row.entities, []) |
             MERGE (e:Entity {name: ent.name, type: ent.type})
+            SET e.normalized_name = coalesce(e.normalized_name, ent.normalized_name)
             MERGE (c)-[:MENTIONS]->(e)
             MERGE (p)-[:HAS_ENTITY]->(e)
+
+            FOREACH (_ IN CASE WHEN ent.concept_uri IS NULL THEN [] ELSE [1] END |
+                MERGE (concept:Concept {uri: ent.concept_uri})
+                ON CREATE SET concept.name = coalesce(ent.concept_name, ent.name), concept.source = 'schema.org'
+                MERGE (e)-[lk:LINKED_TO_CONCEPT]->(concept)
+                SET lk.method = 'controlled_vocabulary',
+                    lk.confidence = coalesce(ent.link_confidence, 0.70),
+                    lk.matched_alias = coalesce(ent.matched_alias, ent.name),
+                    lk.updated_at = datetime()
+                MERGE (p)-[:HAS_CONCEPT]->(concept)
+            )
         )
         
         FOREACH (rel IN coalesce(row.relations, []) |
@@ -906,14 +1200,18 @@ class GraphRAGService:
         chunk_size: int = 800,
         chunk_overlap: int = 120,
         auto_extract_entities: bool = True,
+        auto_link_to_ontology: bool = True,
     ) -> Dict[str, Any]:
         """
         从 MySQL 知识库同步论文数据到 Neo4j，支持自动实体提取。
         
         Args:
             auto_extract_entities: 是否自动从切片中提取关键实体（需要 LLM 服务）
+            auto_link_to_ontology: 是否执行实体到受控词表概念的自动链接
         """
         self._ensure_embedding_ready()
+        if auto_link_to_ontology:
+            self.upsert_controlled_vocabulary()
         db = SessionLocal()
         try:
             query = db.query(KnowledgeBase)
@@ -990,6 +1288,7 @@ class GraphRAGService:
                 "chunks": len(rows),
                 "upserted": result.get("upserted", 0),
                 "auto_extract_entities": auto_extract_entities,
+                "auto_link_to_ontology": auto_link_to_ontology,
             }
         finally:
             db.close()
@@ -1042,24 +1341,81 @@ class GraphRAGService:
         self.ensure_vector_index(force_recreate=False)
         return self.upsert_paper_chunks(rows)
 
-    def similarity_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
-        """基于向量索引执行相似度检索。"""
+    def similarity_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        paper_ids: Optional[List[int]] = None,
+        semantic_expand: bool = True,
+        expansion_hops: int = 1,
+    ) -> Dict[str, Any]:
+        """向量+语义本体+关键词三路融合检索。"""
         self._ensure_embedding_ready()
+        self.upsert_controlled_vocabulary()
+
+        effective_top_k = max(1, min(int(top_k), 30))
+        expanded_fetch_k = max(12, effective_top_k * 4)
+        vector_fetch_k = max(10, effective_top_k * 3)
+        normalized_paper_ids = sorted({int(pid) for pid in (paper_ids or [])}) or None
+
         query_embedding = self._embed_text(query_text)
+        keywords = [token.lower() for token in self._extract_query_tokens(query_text)][:10]
+
+        seed_concepts: List[Dict[str, str]] = []
+        for token in self._extract_query_tokens(query_text):
+            linked = self._link_entity_to_concept(token)
+            if linked:
+                seed_concepts.append({"uri": linked["concept_uri"], "name": linked["concept_name"]})
+        dedupe_seed = {}
+        for concept in seed_concepts:
+            dedupe_seed[concept["uri"]] = concept
+        seed_concepts = list(dedupe_seed.values())
+
+        expanded_concept_uris = []
+        if semantic_expand and seed_concepts:
+            expanded_concept_uris = self._expand_concept_uris(
+                [c["uri"] for c in seed_concepts],
+                max_hops=expansion_hops,
+                max_size=40,
+            )
+
+        concept_uris = sorted(set([c["uri"] for c in seed_concepts] + expanded_concept_uris))
 
         vector_query = """
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
         YIELD node, score
         OPTIONAL MATCH (p:Paper)-[:HAS_CHUNK]->(node)
+        WHERE p IS NOT NULL AND ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
         RETURN
           node.chunk_id AS chunk_id,
           node.text AS text,
           node.index AS chunk_index,
-          score,
+          toFloat(score) AS score,
           p.paper_id AS paper_id,
           p.title AS title,
-          p.year AS year
+          p.year AS year,
+          'vector' AS recall_source,
+          [] AS matched_concepts
         ORDER BY score DESC
+        """
+
+        semantic_query = """
+        MATCH (p:Paper)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(:Entity)-[:LINKED_TO_CONCEPT]->(concept:Concept)
+        WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
+          AND concept.uri IN $concept_uris
+        WITH p, c, collect(DISTINCT concept.name)[0..5] AS matched_concepts, count(DISTINCT concept) AS hit_count
+        RETURN
+          c.chunk_id AS chunk_id,
+          c.text AS text,
+          c.index AS chunk_index,
+          toFloat(hit_count) AS score,
+          p.paper_id AS paper_id,
+          p.title AS title,
+          p.year AS year,
+          'semantic' AS recall_source,
+          matched_concepts
+        ORDER BY score DESC, p.year DESC
+        LIMIT $limit
         """
 
         keyword_query = """
@@ -1067,13 +1423,13 @@ class GraphRAGService:
         WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
           AND (
             size($keywords) = 0
-            OR any(k IN $keywords WHERE toLower(coalesce(c.text, "")) CONTAINS k OR toLower(coalesce(p.title, "")) CONTAINS k)
+            OR any(k IN $keywords WHERE toLower(coalesce(c.text, '')) CONTAINS k OR toLower(coalesce(p.title, '')) CONTAINS k)
           )
         WITH p, c,
              reduce(s = 0.0, k IN $keywords |
                 s + CASE
-                    WHEN toLower(coalesce(c.text, "")) CONTAINS k THEN 1.0
-                    WHEN toLower(coalesce(p.title, "")) CONTAINS k THEN 0.6
+                    WHEN toLower(coalesce(c.text, '')) CONTAINS k THEN 1.0
+                    WHEN toLower(coalesce(p.title, '')) CONTAINS k THEN 0.6
                     ELSE 0.0
                 END
              ) AS lexical_score
@@ -1081,22 +1437,15 @@ class GraphRAGService:
           c.chunk_id AS chunk_id,
           c.text AS text,
           c.index AS chunk_index,
-          lexical_score AS score,
+          toFloat(lexical_score) AS score,
           p.paper_id AS paper_id,
           p.title AS title,
-          p.year AS year
+          p.year AS year,
+          'keyword' AS recall_source,
+          [] AS matched_concepts
         ORDER BY lexical_score DESC, p.year DESC
         LIMIT $limit
         """
-
-        def _normalize_keywords(source: str) -> List[str]:
-            tokens = re.findall(r"[A-Za-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", (source or "").lower())
-            # 保序去重，避免关键词列表过长导致查询噪声。
-            ordered_unique: List[str] = []
-            for token in tokens:
-                if token not in ordered_unique:
-                    ordered_unique.append(token)
-            return ordered_unique[:10]
 
         def _dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             best_by_chunk: Dict[str, Dict[str, Any]] = {}
@@ -1109,51 +1458,47 @@ class GraphRAGService:
                 new_score = float(row.get("score") or 0.0)
                 if current is None or new_score > current_score:
                     best_by_chunk[chunk_id] = row
+                elif current and row.get("recall_source") == "semantic" and current.get("recall_source") != "semantic":
+                    # 同分时优先保留语义通路，提升可解释性。
+                    best_by_chunk[chunk_id] = row
             ordered = list(best_by_chunk.values())
             ordered.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
             return ordered
 
-        keywords = _normalize_keywords(query_text)
-        search_mode = "vector"
         all_rows: List[Dict[str, Any]] = []
-
+        search_mode = "vector"
         with self.driver.session() as session:
-            # 第一阶段：向量检索（保留用户给定 paper_ids 过滤）
-            base_rows = list(
+            vector_rows = list(
                 session.run(
                     vector_query,
                     {
                         "index_name": self.settings.vector_index_name,
                         "top_k": vector_fetch_k,
                         "embedding": query_embedding,
+                        "paper_ids": normalized_paper_ids,
                     },
                 )
             )
+            all_rows.extend(vector_rows)
 
-            all_rows.extend(base_rows)
-
-            # 第二阶段：若过滤后召回过少，放宽到全库补齐。
-            if len(base_rows) < effective_top_k and normalized_paper_ids is not None:
-                relaxed_vector_rows = list(
+            if concept_uris:
+                semantic_rows = list(
                     session.run(
-                        vector_query,
+                        semantic_query,
                         {
-                            "index_name": self.settings.vector_index_name,
-                            "top_k": expanded_fetch_k,
-                            "embedding": query_embedding,
-                            "paper_ids": None,
+                            "paper_ids": normalized_paper_ids,
+                            "concept_uris": concept_uris,
+                            "limit": expanded_fetch_k,
                         },
                     )
                 )
-                if relaxed_vector_rows:
-                    search_mode = "vector_relaxed_paper_filter"
-                    all_rows.extend(relaxed_vector_rows)
+                if semantic_rows:
+                    search_mode = "vector_semantic"
+                    all_rows.extend(semantic_rows)
 
             merged_rows = _dedupe_rows(all_rows)
-
-            # 第三阶段：向量仍不足时，使用关键词回退检索。
             if len(merged_rows) < max(3, effective_top_k // 2):
-                lexical_rows = list(
+                keyword_rows = list(
                     session.run(
                         keyword_query,
                         {
@@ -1163,51 +1508,65 @@ class GraphRAGService:
                         },
                     )
                 )
-                if lexical_rows:
-                    search_mode = "keyword_fallback"
-                    merged_rows = _dedupe_rows(merged_rows + lexical_rows)
-
-            if len(merged_rows) < max(3, effective_top_k // 2) and normalized_paper_ids is not None:
-                relaxed_lexical_rows = list(
-                    session.run(
-                        keyword_query,
-                        {
-                            "paper_ids": None,
-                            "keywords": keywords,
-                            "limit": expanded_fetch_k,
-                        },
-                    )
-                )
-                if relaxed_lexical_rows:
-                    search_mode = "keyword_fallback_relaxed_paper_filter"
-                    merged_rows = _dedupe_rows(merged_rows + relaxed_lexical_rows)
+                if keyword_rows:
+                    search_mode = "vector_semantic_keyword"
+                    merged_rows = _dedupe_rows(merged_rows + keyword_rows)
 
         rows = merged_rows[:effective_top_k]
 
         response = [
             {
-                "chunk_id": r["chunk_id"],
-                "text": r["text"],
-                "chunk_index": r["chunk_index"],
-                "score": r["score"],
-                "paper_id": r["paper_id"],
-                "title": r["title"],
-                "year": r["year"],
+                "chunk_id": r.get("chunk_id"),
+                "text": r.get("text"),
+                "chunk_index": r.get("chunk_index"),
+                "score": float(r.get("score") or 0.0),
+                "paper_id": r.get("paper_id"),
+                "title": r.get("title"),
+                "year": r.get("year"),
+                "recall_source": r.get("recall_source") or "vector",
+                "matched_concepts": r.get("matched_concepts") or [],
             }
             for r in rows
         ]
+
+        semantic_facts = [
+            {
+                "fact": f"{seed['name']} 属于/关联到本体概念 {seed['uri']}",
+                "source": "ontology",
+            }
+            for seed in seed_concepts[:8]
+        ]
+
         return {
             "query_text": query_text,
-            "top_k": top_k,
+            "top_k": effective_top_k,
+            "search_mode": search_mode,
+            "paper_ids": normalized_paper_ids,
+            "seed_concepts": seed_concepts,
+            "expanded_concept_uris": concept_uris,
+            "semantic_facts": semantic_facts,
             "results": response,
         }
 
-    def rag_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+    def rag_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        paper_ids: Optional[List[int]] = None,
+        semantic_expand: bool = True,
+        expansion_hops: int = 1,
+    ) -> Dict[str, Any]:
         """检索相关 chunks 后调用本地 LLM 生成回答。"""
         self._ensure_ai_ready()
 
-        # 1) 向量检索获取上下文
-        search_result = self.similarity_search(query_text, top_k=top_k)
+        # 1) 融合检索获取上下文
+        search_result = self.similarity_search(
+            query_text,
+            top_k=top_k,
+            paper_ids=paper_ids,
+            semantic_expand=semantic_expand,
+            expansion_hops=expansion_hops,
+        )
         chunks = search_result.get("results", [])
         if not chunks:
             return {
@@ -1221,14 +1580,26 @@ class GraphRAGService:
         context = "\n\n".join(
             f"[来源: {c.get('title', '未知')}] {c['text']}" for c in chunks if c.get("text")
         )
+        semantic_fact_lines = [f"- {item['fact']}" for item in (search_result.get("semantic_facts") or [])]
+        semantic_facts_text = "\n".join(semantic_fact_lines) if semantic_fact_lines else "- 无"
 
         # 3) 调用本地 LLM 生成回答
         response = ask_messages(
             model=self.settings.llm_model,
             temperature=0,
             messages=[
-                {"role": "system", "content": "你是一个学术论文助手。根据提供的论文片段回答用户问题，回答要准确、有依据。如果片段中没有相关信息，请如实说明。"},
-                {"role": "user", "content": f"参考资料：\n{context}\n\n问题：{query_text}"},
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个学术论文助手。根据提供的论文片段和语义本体事实回答用户问题，"
+                        "回答要准确、有依据，并尽量解释概念之间的逻辑关系。"
+                        "如果资料中没有相关信息，请明确说明。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"语义事实：\n{semantic_facts_text}\n\n参考资料：\n{context}\n\n问题：{query_text}",
+                },
             ],
         )
         answer = response.content.strip()
@@ -1236,8 +1607,19 @@ class GraphRAGService:
         return {
             "query_text": query_text,
             "top_k": top_k,
+            "search_mode": search_result.get("search_mode"),
+            "semantic_facts": search_result.get("semantic_facts", []),
             "answer": answer,
-            "context_chunks": [{"chunk_id": c.get("chunk_id"), "text": c.get("text"), "score": c.get("score")} for c in chunks],
+            "context_chunks": [
+                {
+                    "chunk_id": c.get("chunk_id"),
+                    "text": c.get("text"),
+                    "score": c.get("score"),
+                    "recall_source": c.get("recall_source"),
+                    "matched_concepts": c.get("matched_concepts", []),
+                }
+                for c in chunks
+            ],
         }
 
     def query_section_entities(self, paper_id: int, section: str) -> Dict[str, Any]:
