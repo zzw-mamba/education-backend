@@ -320,6 +320,77 @@ def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> L
     return _heuristic_extract(text)
 
 
+def _dynamic_entity_mapping(entities: list, llm_model: Optional[str] = None) -> dict:
+    """使用大语言模型动态分析并建立同义词映射表"""
+    if not entities:
+        return {}
+        
+    prompt = f"""你是一个智能知识图谱引擎。我有一组从文本中提取的图谱实体。
+它们可能包含各种变体（中英文混用、缩写与全拼、极度相似的概念等）。
+请分析这些实体，发现同义词并将它们映射到一个**标准化的正式名称**。
+
+提取的实体列表: {json.dumps(entities, ensure_ascii=False)}
+
+【严格要求】
+1. 只合并意义真正相同的概念（例如："AI", " Artificial intelligence  ", "人工智能" -> "人工智能 (AI)"）。
+2. 不同维度的概念不可合并。
+3. 请以规范的 JSON 对象形式返回，格式：{{"原实体变体1": "标准名", "原实体变体2": "标准名"}}。
+4. **务必只输出JSON**！不要加 ```json 这样的markdown边框。
+"""
+    try:
+        response = ask_messages(
+            model=llm_model,
+            temperature=0.1,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        content = response.content.strip()
+        content = re.sub(r"^```[a-zA-Z]*\n|```$", "", content, flags=re.MULTILINE).strip()
+        
+        mapping = json.loads(content)
+        return mapping
+    except Exception as e:
+        print(f"[大模型消歧请求失败，将仅使用基础规则清洗]: {e}")
+        return {}
+
+def resolve_and_clean_triplets(triplets: list, llm_model: Optional[str] = None) -> list:
+    # ================= 优化 4：图谱实体消歧去重 =================
+    """结合基础字符清洗+大模型动态消歧的一体化管线"""
+    # 1. 基础硬规则清理 (去空、去引号)
+    baselined = []
+    unique_entities = set()
+    for t in triplets:
+        s = t['source'].strip(' \t\n\r"\'')
+        tgt = t['target'].strip(' \t\n\r"\'')
+        r = t['relation'].strip(' \t\n\r"\'')
+        baselined.append({"source": s, "target": tgt, "relation": r})
+        unique_entities.add(s)
+        unique_entities.add(tgt)
+
+    # 2. 召唤大模型做智能表映射
+    print(f"   [实体消歧] 发现 {len(unique_entities)} 个独立实体变体，正在请求大模型合并同义词...")
+    mapping = _dynamic_entity_mapping(list(unique_entities), llm_model=llm_model)
+    if mapping:
+        print(f"   [实体消歧] 大模型成功生成合并规则表！")
+        for k, v in mapping.items():
+            print(f"     > {k}  =>  {v}")
+            
+    # 3. 执行替换并合并重叠的关系
+    resolved = []
+    for t in baselined:
+        s_name = t['source']
+        t_name = t['target']
+        
+        # 即使模型没有返回某个键，我们也保留原值
+        final_s = mapping.get(s_name) or mapping.get(s_name.lower()) or s_name
+        final_t = mapping.get(t_name) or mapping.get(t_name.lower()) or t_name
+        
+        resolved.append({"source": final_s, "target": final_t, "relation": t['relation']})
+        
+    # 4. 最后做 Set 的绝对去重
+    unique_resolved = [dict(t) for t in {tuple(d.items()) for d in resolved}]
+    return unique_resolved
+
+
 class GraphRAGService:
     def __init__(self, settings: Optional[GraphRAGSettings] = None):
         """初始化 GraphRAG 服务实例与运行时状态。"""
@@ -789,6 +860,7 @@ class GraphRAGService:
             # 如果未提供实体且未提供关系，尝试从文本中自动提取三元组
             if not entities and not relations:
                 extracted_triplets = _extract_triplets_from_text(text, self.settings.llm_model)
+                extracted_triplets = resolve_and_clean_triplets(extracted_triplets, self.settings.llm_model)
                 relations = extracted_triplets
                 
                 # 从三元组中归纳出所有去重的实体节点
