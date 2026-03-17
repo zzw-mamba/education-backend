@@ -1,15 +1,20 @@
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
 import ast
+from typing import List, Optional
+
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel, Field
 from prompt import (
     TEMPLATE_ANALYSE_PROMPT,
     TEMPLATE_BUILD_USER_PROMPT_TEMPLATE,
     TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE,
+    TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT,
+    TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE,
 )
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from database import get_db
 from models import Template, User
+from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
 from routers.user import get_current_user
 from utils.model import ask_messages, LLMError
 
@@ -28,6 +33,20 @@ class TemplateRequest(BaseModel):
     example: str = None
     icon_path: str = None
 
+
+class TemplateSummaryRequest(BaseModel):
+    """基于模板 + GraphRAG 生成摘要请求模型。"""
+    query_text: str = Field(..., description="用户关注主题/问题")
+    paper_ids: Optional[List[int]] = Field(default=None, description="可选：限定论文 ID 范围")
+    top_k: int = Field(default=8, ge=1, le=30, description="向量召回数量")
+    focus_direction: str = Field(default="行业发展趋势与技术演进路径", description="摘要聚焦方向")
+    style: str = Field(default="客观严谨的学术/商业报告风格", description="文风要求")
+    word_limit: str = Field(default="500-800字", description="篇幅要求")
+    graph_top_entities: int = Field(default=8, ge=1, le=20, description="每篇论文抽取的核心实体数")
+    snippets_per_entity: int = Field(default=2, ge=1, le=5, description="每个实体保留的上下文片段数")
+    neighbor_limit: int = Field(default=4, ge=0, le=20, description="图谱实体邻居数量")
+    max_graph_papers: int = Field(default=3, ge=1, le=10, description="最多补充图谱上下文的论文数")
+
 def get_template_prompt(description: str) -> str:
     return TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE.format(description=description)
 
@@ -39,6 +58,98 @@ def extract_first_brace_block(text: str) -> str:
     if start == -1 or end == -1 or start >= end:
         return text
     return text[start:end + 1]
+
+
+def _format_document_chunks(chunks: List[dict], paper_citation_ids: dict) -> str:
+    """将召回片段格式化为可读上下文，并按文献分配唯一引用编号。"""
+    lines: List[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        score = chunk.get("score")
+        score_text = f"{float(score):.4f}" if score is not None else "N/A"
+        paper_id = chunk.get("paper_id")
+        paper_key = f"paper:{paper_id}" if paper_id is not None else f"title:{(chunk.get('title') or '').strip()}"
+        citation_id = paper_citation_ids.get(paper_key)
+        lines.append(
+            (
+                f"[Chunk {idx}] [文献引用标记：{citation_id}] 文献ID={paper_id}，标题={chunk.get('title') or '未知'}，"
+                f"年份={chunk.get('year')}，chunk_index={chunk.get('chunk_index')}，相似度={score_text}\n"
+                f"{chunk.get('text') or ''}"
+            )
+        )
+    print("\n".join(lines))
+    return "\n\n".join(lines)
+
+
+def _build_citation_mapping(chunks: List[dict]) -> tuple[dict, dict]:
+    """按文献维度构建引用映射，保证一篇文献仅对应一个引用标记。"""
+    citations: dict = {}
+    paper_citation_ids: dict = {}
+
+    for chunk in chunks:
+        paper_id = chunk.get("paper_id")
+        title = (chunk.get("title") or "未知").strip() or "未知"
+        paper_key = f"paper:{paper_id}" if paper_id is not None else f"title:{title}"
+
+        if paper_key not in paper_citation_ids:
+            citation_id = len(paper_citation_ids) + 1
+            paper_citation_ids[paper_key] = citation_id
+            citations[citation_id] = {
+                "id": citation_id,
+                "paper_id": paper_id,
+                "title": title,
+                "year": chunk.get("year"),
+                "chunk_ids": [],
+                "scores": [],
+                "text_excerpts": [],
+            }
+
+        citation_id = paper_citation_ids[paper_key]
+        citation_item = citations[citation_id]
+        chunk_id = chunk.get("chunk_id")
+        if chunk_id and chunk_id not in citation_item["chunk_ids"]:
+            citation_item["chunk_ids"].append(chunk_id)
+
+        score = chunk.get("score")
+        if score is not None:
+            citation_item["scores"].append(float(score))
+
+        excerpt = (chunk.get("text") or "")[:200]
+        if excerpt and excerpt not in citation_item["text_excerpts"] and len(citation_item["text_excerpts"]) < 3:
+            citation_item["text_excerpts"].append(excerpt)
+
+    for citation in citations.values():
+        scores = citation.pop("scores", [])
+        citation["max_score"] = max(scores) if scores else None
+        citation["avg_score"] = (sum(scores) / len(scores)) if scores else None
+
+    return citations, paper_citation_ids
+
+
+def _format_graph_context(service, request: TemplateSummaryRequest, chunks: List[dict]) -> str:
+    """基于召回论文补充图谱实体上下文，增强跨片段关系理解。"""
+    paper_ids: List[int] = []
+    for chunk in chunks:
+        paper_id = chunk.get("paper_id")
+        if isinstance(paper_id, int) and paper_id not in paper_ids:
+            paper_ids.append(paper_id)
+
+    graph_context_parts: List[str] = []
+    for paper_id in paper_ids[: request.max_graph_papers]:
+        try:
+            refined = service.get_graph_refined_context(
+                paper_id=paper_id,
+                top_entities=request.graph_top_entities,
+                snippets_per_entity=request.snippets_per_entity,
+                neighbor_limit=request.neighbor_limit,
+            )
+        except Exception:
+            continue
+
+        blocks = refined.get("context_blocks", [])
+        if blocks:
+            graph_context_parts.append(f"[Paper {paper_id}]\n" + "\n\n".join(blocks))
+
+    return "\n\n".join(graph_context_parts)
 
 @router.post("/template/build", response_model=TemplateResponse)
 def build_template(request: str):
@@ -124,6 +235,106 @@ def add_template(information: TemplateRequest, current_user: User = Depends(get_
             status_code=400,
             detail=f"保存模板失败: {str(e)}"
         )
+
+
+@router.post("/template/{template_id}/summary", status_code=200)
+def generate_summary_by_template(
+    template_id: int,
+    request: TemplateSummaryRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """根据模板 ID + GraphRAG 检索结果生成结构化全局摘要。"""
+    print(request)
+    template = (
+        db.query(Template)
+        .filter(
+            Template.id == template_id,
+            or_(Template.user_id == current_user.id, Template.user_id == 0),
+        )
+        .first()
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限访问")
+
+    if GRAPHRAG_IMPORT_ERROR is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"neo4j-graphrag 导入失败: {GRAPHRAG_IMPORT_ERROR}",
+        )
+
+    try:
+        graphrag_service = get_graphrag_service()
+        search_result = graphrag_service.similarity_search(
+            request.query_text,
+            top_k=request.top_k,
+            paper_ids=request.paper_ids,
+        )
+        chunks = search_result.get("results", [])
+        if not chunks:
+            return {
+                "code": 200,
+                "message": "未检索到相关片段，无法生成摘要",
+                "data": {
+                    "template_id": template.id,
+                    "template_name": template.name,
+                    "query_text": request.query_text,
+                    "summary": "未检索到相关片段，请调整检索问题或放宽 paper_ids 范围。",
+                    "retrieved_chunks": 0,
+                    "graph_context_blocks": 0,
+                },
+            }
+
+        citations, paper_citation_ids = _build_citation_mapping(chunks)
+        document_chunks = _format_document_chunks(chunks, paper_citation_ids)
+        graph_relations = _format_graph_context(graphrag_service, request, chunks)
+        if not graph_relations.strip():
+            graph_relations = "暂无可用图谱上下文。"
+
+        prompt_text = TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE.format(
+            template_prompt=template.prompt,
+            query_text=request.query_text,
+            focus_direction=request.focus_direction,
+            style=request.style,
+            word_limit=request.word_limit,
+            document_chunks=document_chunks,
+            graph_relations=graph_relations,
+        )
+
+        llm_result = ask_messages(
+            messages=[
+                {"role": "system", "content": TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_text},
+            ],
+            max_tokens=2200,
+            temperature=0.2,
+            top_p=0.8,
+            extra_payload={
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        graph_block_count = graph_relations.count("【实体】")
+        return {
+            "code": 200,
+            "message": "摘要生成成功",
+            "data": {
+                "template_id": template.id,
+                "template_name": template.name,
+                "query_text": request.query_text,
+                "summary": (llm_result.content or "").strip(),
+                "retrieved_chunks": len(chunks),
+                "graph_context_blocks": graph_block_count,
+                "paper_ids": search_result.get("paper_ids"),
+                "citations": citations,
+            },
+        }
+    except LLMError as exc:
+        raise HTTPException(status_code=503, detail=f"无法连接到大模型服务: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"基于模板生成摘要失败: {exc}")
 
 
 @router.get("/template/my", status_code=200)

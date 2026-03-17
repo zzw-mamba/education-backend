@@ -45,6 +45,33 @@ TEMPLATE_BUILD_USER_PROMPT_TEMPLATE = (
 
 TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE = "请根据以下描述生成一个合适的模板：\n\n{description}"
 
+TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT = (
+    "你是一名资深知识图谱分析师与信息融合专家。"
+    "请严格基于提供的文档片段与实体图谱关系进行归纳，"
+    "避免虚构，不确定处需保持谨慎措辞。"
+)
+
+TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE = (
+    "【模板框架】\n{template_prompt}\n\n"
+    "【用户问题/主题】\n{query_text}\n\n"
+    "【聚焦方向】\n{focus_direction}\n\n"
+    "【文风要求】\n{style}\n\n"
+    "【篇幅要求】\n{word_limit}\n\n"
+    "【文档片段集合（GraphRAG召回）】\n{document_chunks}\n\n"
+    "【实体图谱关联（GraphRAG图上下文）】\n{graph_relations}\n\n"
+    "【引用溯源要求】\n"
+    "在摘要中引用或参考任何上述文档片段时，请用方括号标记引用编号，例如 [1]、[2]。\n"
+    "编号对应文档片段中的文献引用标记（如 [文献引用标记：1] 对应 [1]）。\n"
+    "同一篇文献即使出现多个 Chunk，也必须使用同一个引用编号，不可重复分配新编号。\n"
+    "多个引用可并列，如 [1][2]。不需要在正文末尾添加参考文献列表。\n\n"
+    "请按以下段落结构输出一篇连贯概述，不要输出标题和要点列表：\n"
+    "1) 第一段：宏观主旨概述（引出全貌）\n"
+    "2) 第二段：实体枢纽与跨片段共性（图谱洞察）\n"
+    "3) 第三段：全局核心结论（3-5个关键结论，用连接词串联）\n"
+    "4) 第四段：全局洞察与收尾（趋势与关键变量）\n"
+    "要求：避免机械罗列，保持学术/商业报告式客观表达，重视引用标记的精准追踪。"
+)
+
 # Material analysis prompts
 MATERIAL_PARSING_PROMPT = """
 ### Role
@@ -131,6 +158,8 @@ __all__ = [
     "TEMPLATE_ANALYSE_PROMPT",
     "TEMPLATE_BUILD_USER_PROMPT_TEMPLATE",
     "TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE",
+    "TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT",
+    "TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE",
     "MATERIAL_PARSING_PROMPT",
     "GRAPHRAG_ENTITY_EXTRACT_SYSTEM_PROMPT",
     "GRAPHRAG_ENTITY_EXTRACT_USER_PROMPT_TEMPLATE",

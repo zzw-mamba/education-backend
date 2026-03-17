@@ -967,16 +967,21 @@ class GraphRAGService:
         top_k: int = 5,
         paper_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
-        """基于向量索引执行相似度检索。"""
+        """基于向量索引执行相似度检索，并在低召回场景自动扩范围。"""
         self._ensure_embedding_ready()
         query_embedding = self._embed_text(query_text)
         self._validate_query_vector_dimension(query_embedding)
+
+        effective_top_k = max(1, int(top_k))
+        # 先放大向量召回候选，再按需要截断，避免过滤后为空。
+        vector_fetch_k = min(max(effective_top_k * 4, effective_top_k), 120)
+        expanded_fetch_k = min(max(effective_top_k * 8, 30), 240)
 
         normalized_paper_ids: Optional[List[int]] = None
         if paper_ids is not None:
             normalized_paper_ids = sorted({int(pid) for pid in paper_ids})
 
-        query = """
+        vector_query = """
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
         YIELD node, score
         MATCH (p:Paper)-[:HAS_CHUNK]->(node)
@@ -992,18 +997,128 @@ class GraphRAGService:
         ORDER BY score DESC
         """
 
+        keyword_query = """
+        MATCH (p:Paper)-[:HAS_CHUNK]->(c:Chunk)
+        WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
+          AND (
+            size($keywords) = 0
+            OR any(k IN $keywords WHERE toLower(coalesce(c.text, "")) CONTAINS k OR toLower(coalesce(p.title, "")) CONTAINS k)
+          )
+        WITH p, c,
+             reduce(s = 0.0, k IN $keywords |
+                s + CASE
+                    WHEN toLower(coalesce(c.text, "")) CONTAINS k THEN 1.0
+                    WHEN toLower(coalesce(p.title, "")) CONTAINS k THEN 0.6
+                    ELSE 0.0
+                END
+             ) AS lexical_score
+        RETURN
+          c.chunk_id AS chunk_id,
+          c.text AS text,
+          c.index AS chunk_index,
+          lexical_score AS score,
+          p.paper_id AS paper_id,
+          p.title AS title,
+          p.year AS year
+        ORDER BY lexical_score DESC, p.year DESC
+        LIMIT $limit
+        """
+
+        def _normalize_keywords(source: str) -> List[str]:
+            tokens = re.findall(r"[A-Za-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", (source or "").lower())
+            # 保序去重，避免关键词列表过长导致查询噪声。
+            ordered_unique: List[str] = []
+            for token in tokens:
+                if token not in ordered_unique:
+                    ordered_unique.append(token)
+            return ordered_unique[:10]
+
+        def _dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            best_by_chunk: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                chunk_id = row.get("chunk_id")
+                if not chunk_id:
+                    continue
+                current = best_by_chunk.get(chunk_id)
+                current_score = float(current.get("score") or 0.0) if current else float("-inf")
+                new_score = float(row.get("score") or 0.0)
+                if current is None or new_score > current_score:
+                    best_by_chunk[chunk_id] = row
+            ordered = list(best_by_chunk.values())
+            ordered.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+            return ordered
+
+        keywords = _normalize_keywords(query_text)
+        search_mode = "vector"
+        all_rows: List[Dict[str, Any]] = []
+
         with self.driver.session() as session:
-            rows = list(
+            # 第一阶段：向量检索（保留用户给定 paper_ids 过滤）
+            base_rows = list(
                 session.run(
-                    query,
+                    vector_query,
                     {
                         "index_name": self.settings.vector_index_name,
-                        "top_k": top_k,
+                        "top_k": vector_fetch_k,
                         "embedding": query_embedding,
                         "paper_ids": normalized_paper_ids,
                     },
                 )
             )
+
+            all_rows.extend(base_rows)
+
+            # 第二阶段：若过滤后召回过少，放宽到全库补齐。
+            if len(base_rows) < effective_top_k and normalized_paper_ids is not None:
+                relaxed_vector_rows = list(
+                    session.run(
+                        vector_query,
+                        {
+                            "index_name": self.settings.vector_index_name,
+                            "top_k": expanded_fetch_k,
+                            "embedding": query_embedding,
+                            "paper_ids": None,
+                        },
+                    )
+                )
+                if relaxed_vector_rows:
+                    search_mode = "vector_relaxed_paper_filter"
+                    all_rows.extend(relaxed_vector_rows)
+
+            merged_rows = _dedupe_rows(all_rows)
+
+            # 第三阶段：向量仍不足时，使用关键词回退检索。
+            if len(merged_rows) < max(3, effective_top_k // 2):
+                lexical_rows = list(
+                    session.run(
+                        keyword_query,
+                        {
+                            "paper_ids": normalized_paper_ids,
+                            "keywords": keywords,
+                            "limit": expanded_fetch_k,
+                        },
+                    )
+                )
+                if lexical_rows:
+                    search_mode = "keyword_fallback"
+                    merged_rows = _dedupe_rows(merged_rows + lexical_rows)
+
+            if len(merged_rows) < max(3, effective_top_k // 2) and normalized_paper_ids is not None:
+                relaxed_lexical_rows = list(
+                    session.run(
+                        keyword_query,
+                        {
+                            "paper_ids": None,
+                            "keywords": keywords,
+                            "limit": expanded_fetch_k,
+                        },
+                    )
+                )
+                if relaxed_lexical_rows:
+                    search_mode = "keyword_fallback_relaxed_paper_filter"
+                    merged_rows = _dedupe_rows(merged_rows + relaxed_lexical_rows)
+
+        rows = merged_rows[:effective_top_k]
 
         response = [
             {
@@ -1019,8 +1134,9 @@ class GraphRAGService:
         ]
         return {
             "query_text": query_text,
-            "top_k": top_k,
+            "top_k": effective_top_k,
             "paper_ids": normalized_paper_ids,
+            "search_mode": search_mode,
             "results": response,
         }
 
