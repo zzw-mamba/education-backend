@@ -50,6 +50,7 @@ class SyncFromMySQLRequest(BaseModel):
 class SetupLocalDBRequest(BaseModel):
     create_vector_index: bool = True
     force_recreate_index: bool = False
+    ontology_file_path: str = Field(default="src/CSO.3.5.nt", description="本体 N-Triples 文件路径")
     sync_from_mysql: bool = False
     paper_ids: Optional[List[int]] = None
     limit: int = Field(default=100, ge=1, le=20000)
@@ -202,6 +203,7 @@ async def setup_local_db(request: SetupLocalDBRequest):
         setup_result = service.setup_local_database(
             create_vector_index=request.create_vector_index,
             force_recreate_index=request.force_recreate_index,
+            ontology_file_path=request.ontology_file_path,
         )
 
         sync_result = None

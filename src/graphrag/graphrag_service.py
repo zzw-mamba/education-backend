@@ -10,6 +10,10 @@ from graphrag.graphrag_config import GraphRAGSettings, get_graphrag_settings
 from database import SessionLocal
 from models import KnowledgeBase
 from utils.model import ask_messages, LLMError
+from prompt import (
+    GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT,
+    GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE,
+)
 
 try:
     from neo4j_graphrag.indexes import create_vector_index
@@ -54,22 +58,6 @@ class LocalEmbeddings:
         return [self.embed_query(t) for t in texts]
 
 
-def _jsonable(value: Any) -> Any:
-    """将任意对象尽可能转换为可 JSON 序列化的结构。"""
-    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
-        return value
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if hasattr(value, "dict"):
-        return value.dict()
-    if hasattr(value, "__dict__"):
-        output = {}
-        for k, v in value.__dict__.items():
-            output[k] = _jsonable(v)
-        return output
-    return str(value)
-
-
 def _normalize_section_name(raw_title: str) -> str:
     """将章节标题标准化为统一的章节名称。"""
     title = (raw_title or "").strip().lower()
@@ -86,6 +74,40 @@ def _normalize_section_name(raw_title: str) -> str:
     if "conclusion" in title or "总结" in title or "结论" in title:
         return "Conclusion"
     return raw_title.strip() if raw_title.strip() else "Body"
+
+
+def _normalize_concept_term(raw: str) -> str:
+    """将术语规范化为可匹配 key（小写+下划线）。"""
+    term = (raw or "").strip().lower()
+    if term.startswith("http://") or term.startswith("https://"):
+        marker = "/topics/"
+        if marker in term:
+            term = term.split(marker, 1)[1]
+        else:
+            term = term.rsplit("/", 1)[-1]
+    term = term.replace("-", "_").replace(" ", "_").replace("/", "_")
+    term = re.sub(r"[^0-9a-z_]+", "", term)
+    term = re.sub(r"_+", "_", term).strip("_")
+    return term
+
+
+def _label_from_topic_uri(uri: str) -> str:
+    """从 topic URI 生成可读名称。"""
+    value = (uri or "").strip()
+    marker = "/topics/"
+    if marker in value:
+        slug = value.split(marker, 1)[1]
+    else:
+        slug = value.rsplit("/", 1)[-1]
+    return re.sub(r"[_\-]+", " ", slug).strip()
+
+
+def _parse_nt_uri_triple(line: str) -> Optional[tuple]:
+    """解析 N-Triples 中 subject/predicate/object 全为 URI 的行。"""
+    match = re.match(r'^\s*<([^>]+)>\s+<([^>]+)>\s+<([^>]+)>\s*\.\s*$', line)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
 
 
 def _split_by_markdown_sections(text: str) -> List[Dict[str, str]]:
@@ -398,15 +420,6 @@ class GraphRAGService:
         self.driver = None
         self.embedder = None
         self.retriever = None
-        # 章节权重：不同章节对摘要的重要性权重
-        self.section_weights = {
-            "Abstract": 0.0,      # 摘要本身不编入权重计算
-            "Introduction": 0.15,  # 背景和问题陈述
-            "Methodology": 0.35,   # 方法论最重要
-            "Experiments": 0.35,   # 实验结果同样重要
-            "Conclusion": 0.15,    # 结论和展望
-            "Body": 0.10           # 其他内容权重较低
-        }
 
     def _has_local_embedding(self) -> bool:
         """检查是否配置了本地 embedding 服务地址。"""
@@ -419,25 +432,6 @@ class GraphRAGService:
         if not api_path.startswith("/"):
             api_path = "/" + api_path
         return base_url + api_path
-
-    def _embed_with_local_service(self, text: str) -> List[float]:
-        """直接调用本地 embedding HTTP 接口生成向量。"""
-        payload = {
-            "input": text,
-            "model": self.settings.embedding_model,
-        }
-        response = requests.post(
-            self._local_embedding_url(),
-            json=payload,
-            timeout=self.settings.local_embedding_timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if "data" in data and data["data"] and "embedding" in data["data"][0]:
-            return data["data"][0]["embedding"]
-        if "embedding" in data:
-            return data["embedding"]
-        raise RuntimeError(f"本地 embedding 服务返回格式不支持: {data}")
 
     def _embed_text(self, text: str) -> List[float]:
         """使用本地 embedding 服务生成向量。"""
@@ -762,7 +756,12 @@ class GraphRAGService:
             "summary_method": "recursive_aggregation",
         }
 
-    def setup_local_database(self, create_vector_index: bool = True, force_recreate_index: bool = False) -> Dict[str, Any]:
+    def setup_local_database(
+        self,
+        create_vector_index: bool = True,
+        force_recreate_index: bool = False,
+        ontology_file_path: str = "CSO.3.5.nt",
+    ) -> Dict[str, Any]:
         """准备本地图数据库环境并返回当前统计信息。"""
         self._ensure_initialized()
         schema_result = self.ensure_graph_schema()
@@ -770,19 +769,268 @@ class GraphRAGService:
         if create_vector_index:
             index_result = self.ensure_vector_index(force_recreate=force_recreate_index)
 
+        ontology_path = ontology_file_path
+        if not os.path.isabs(ontology_path):
+            project_root = os.path.dirname(os.path.dirname(__file__))
+            ontology_path = os.path.join(project_root, os.path.normpath(ontology_path).replace("src\\", "").replace("src/", ""))
+        print(f"[GraphRAG] 使用本体文件路径: {ontology_path}")
+        ontology_result = self.import_ontology(
+            nt_file_path=ontology_path,
+            batch_size=3000,
+            max_triples=0,
+            link_existing_entities=True,
+        )
+
         with self.driver.session() as session:
             paper_count = session.run("MATCH (p:Paper) RETURN count(p) AS c").single()["c"]
             chunk_count = session.run("MATCH (c:Chunk) RETURN count(c) AS c").single()["c"]
             entity_count = session.run("MATCH (e:Entity) RETURN count(e) AS c").single()["c"]
+            concept_count = session.run("MATCH (c:Concept) RETURN count(c) AS c").single()["c"]
 
         return {
             "schema_ready": schema_result.get("schema_ready", False),
             "vector_index": index_result,
+            "ontology": ontology_result,
             "counts": {
                 "paper": paper_count,
                 "chunk": chunk_count,
                 "entity": entity_count,
+                "concept": concept_count,
             },
+        }
+
+    def link_entities_to_concept(
+        self,
+        entity_rows: Optional[List[Dict[str, str]]] = None,
+        only_unlinked: bool = True,
+    ) -> Dict[str, Any]:
+        """将 Entity 节点按标准化名称关联到 Concept。"""
+        self._ensure_initialized()
+        self.ensure_graph_schema()
+
+        with self.driver.session() as session:
+            concept_count_row = session.run("MATCH (c:Concept) RETURN count(c) AS c").single()
+            concept_count = int(concept_count_row["c"] if concept_count_row else 0)
+            if concept_count == 0:
+                return {"linked": 0, "concepts": 0, "matched_candidates": 0}
+
+            rows_for_match: List[Dict[str, str]] = []
+            if entity_rows is not None:
+                for item in entity_rows:
+                    name = str(item.get("name") or "").strip()
+                    etype = str(item.get("type") or "Unknown").strip() or "Unknown"
+                    if not name:
+                        continue
+                    normalized_name = _normalize_concept_term(name)
+                    if not normalized_name:
+                        continue
+                    rows_for_match.append({"name": name, "type": etype, "normalized_name": normalized_name})
+            else:
+                if only_unlinked:
+                    fetch_query = """
+                    MATCH (e:Entity)
+                    WHERE e.name IS NOT NULL AND NOT (e)-[:ALIGNED_TO_CONCEPT]->(:Concept)
+                    RETURN e.name AS name, e.type AS type
+                    """
+                else:
+                    fetch_query = """
+                    MATCH (e:Entity)
+                    WHERE e.name IS NOT NULL
+                    RETURN e.name AS name, e.type AS type
+                    """
+                for record in session.run(fetch_query):
+                    name = str(record["name"] or "").strip()
+                    etype = str(record["type"] or "Unknown").strip() or "Unknown"
+                    if not name:
+                        continue
+                    normalized_name = _normalize_concept_term(name)
+                    if not normalized_name:
+                        continue
+                    rows_for_match.append({"name": name, "type": etype, "normalized_name": normalized_name})
+
+            dedup: Dict[str, Dict[str, str]] = {}
+            for row in rows_for_match:
+                dedup[f"{row['name']}||{row['type']}"] = row
+            rows = list(dedup.values())
+            if not rows:
+                return {"linked": 0, "concepts": concept_count, "matched_candidates": 0}
+
+            link_query = """
+            UNWIND $rows AS row
+            MATCH (e:Entity {name: row.name, type: row.type})
+            MATCH (c:Concept {normalized_name: row.normalized_name})
+            MERGE (e)-[:ALIGNED_TO_CONCEPT {method: 'normalized_exact'}]->(c)
+            RETURN count(*) AS linked
+            """
+            linked_row = session.run(link_query, {"rows": rows}).single()
+            linked_count = int(linked_row["linked"] if linked_row else 0)
+
+        return {
+            "linked": linked_count,
+            "concepts": concept_count,
+            "matched_candidates": len(rows),
+        }
+
+    def import_ontology(
+        self,
+        nt_file_path: str,
+        batch_size: int = 2000,
+        max_triples: int = 0,
+        link_existing_entities: bool = True,
+    ) -> Dict[str, Any]:
+        """从 N-Triples 文件导入领域概念及其关系。"""
+        self._ensure_initialized()
+        self.ensure_graph_schema()
+
+        file_path = nt_file_path if os.path.isabs(nt_file_path) else os.path.join(os.getcwd(), nt_file_path)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"未找到本体文件: {file_path}")
+
+        predicate_to_rel = {
+            "http://cso.kmi.open.ac.uk/schema/cso#superTopicOf": "SUPER_TOPIC_OF",
+            "http://cso.kmi.open.ac.uk/schema/cso#contributesTo": "CONTRIBUTES_TO",
+            "http://cso.kmi.open.ac.uk/schema/cso#preferentialEquivalent": "PREFERENTIAL_EQUIVALENT",
+            "http://cso.kmi.open.ac.uk/schema/cso#relatedEquivalent": "RELATED_EQUIVALENT",
+        }
+
+        node_upsert_query = """
+        UNWIND $nodes AS node
+        MERGE (c:Concept {uri: node.uri})
+        SET c.name = node.name,
+            c.normalized_name = node.normalized_name,
+            c.updated_at = datetime()
+        """
+
+        relation_queries = {
+            "SUPER_TOPIC_OF": """
+            UNWIND $rows AS row
+            MATCH (s:Concept {uri: row.source_uri})
+            MATCH (t:Concept {uri: row.target_uri})
+            MERGE (s)-[r:SUPER_TOPIC_OF]->(t)
+            SET r.source = 'ontology'
+            """,
+            "CONTRIBUTES_TO": """
+            UNWIND $rows AS row
+            MATCH (s:Concept {uri: row.source_uri})
+            MATCH (t:Concept {uri: row.target_uri})
+            MERGE (s)-[r:CONTRIBUTES_TO]->(t)
+            SET r.source = 'ontology'
+            """,
+            "PREFERENTIAL_EQUIVALENT": """
+            UNWIND $rows AS row
+            MATCH (s:Concept {uri: row.source_uri})
+            MATCH (t:Concept {uri: row.target_uri})
+            MERGE (s)-[r:PREFERENTIAL_EQUIVALENT]->(t)
+            SET r.source = 'ontology'
+            """,
+            "RELATED_EQUIVALENT": """
+            UNWIND $rows AS row
+            MATCH (s:Concept {uri: row.source_uri})
+            MATCH (t:Concept {uri: row.target_uri})
+            MERGE (s)-[r:RELATED_EQUIVALENT]->(t)
+            SET r.source = 'ontology'
+            """,
+        }
+
+        def _flush_batches(session_obj, node_map: Dict[str, Dict[str, str]], rel_rows: List[Dict[str, str]]) -> Dict[str, int]:
+            written_nodes = 0
+            written_rels = 0
+
+            if node_map:
+                node_rows = list(node_map.values())
+                session_obj.run(node_upsert_query, {"nodes": node_rows})
+                written_nodes = len(node_rows)
+
+            if rel_rows:
+                grouped: Dict[str, List[Dict[str, str]]] = {
+                    "SUPER_TOPIC_OF": [],
+                    "CONTRIBUTES_TO": [],
+                    "PREFERENTIAL_EQUIVALENT": [],
+                    "RELATED_EQUIVALENT": [],
+                }
+                for rel in rel_rows:
+                    grouped[rel["rel_type"]].append(rel)
+
+                for rel_type, rows in grouped.items():
+                    if not rows:
+                        continue
+                    session_obj.run(relation_queries[rel_type], {"rows": rows})
+                    written_rels += len(rows)
+
+            return {"nodes": written_nodes, "rels": written_rels}
+
+        triples_scanned = 0
+        triples_imported = 0
+        concept_nodes_written = 0
+        relations_written = 0
+        per_batch_nodes: Dict[str, Dict[str, str]] = {}
+        per_batch_rels: List[Dict[str, str]] = []
+        batch_limit = max(200, int(batch_size or 2000))
+
+        with self.driver.session() as session:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+                for raw_line in handle:
+                    triples_scanned += 1
+                    parsed = _parse_nt_uri_triple(raw_line)
+                    if parsed is None:
+                        continue
+
+                    subject_uri, predicate_uri, object_uri = parsed
+                    rel_type = predicate_to_rel.get(predicate_uri)
+                    if rel_type is None:
+                        continue
+
+                    subject_name = _label_from_topic_uri(subject_uri)
+                    object_name = _label_from_topic_uri(object_uri)
+                    per_batch_nodes[subject_uri] = {
+                        "uri": subject_uri,
+                        "name": subject_name,
+                        "normalized_name": _normalize_concept_term(subject_name),
+                    }
+                    per_batch_nodes[object_uri] = {
+                        "uri": object_uri,
+                        "name": object_name,
+                        "normalized_name": _normalize_concept_term(object_name),
+                    }
+                    per_batch_rels.append(
+                        {
+                            "source_uri": subject_uri,
+                            "target_uri": object_uri,
+                            "rel_type": rel_type,
+                        }
+                    )
+                    triples_imported += 1
+
+                    if len(per_batch_rels) >= batch_limit:
+                        flushed = _flush_batches(session, per_batch_nodes, per_batch_rels)
+                        concept_nodes_written += flushed["nodes"]
+                        relations_written += flushed["rels"]
+                        per_batch_nodes = {}
+                        per_batch_rels = []
+
+                    if max_triples and triples_imported >= int(max_triples):
+                        break
+
+            flushed = _flush_batches(session, per_batch_nodes, per_batch_rels)
+            concept_nodes_written += flushed["nodes"]
+            relations_written += flushed["rels"]
+
+            concept_count_row = session.run("MATCH (c:Concept) RETURN count(c) AS c").single()
+            concept_count = int(concept_count_row["c"] if concept_count_row else 0)
+
+        link_result = {"linked": 0, "concepts": concept_count, "matched_candidates": 0}
+        if link_existing_entities:
+            link_result = self.link_entities_to_concept(entity_rows=None, only_unlinked=True)
+
+        return {
+            "file_path": file_path,
+            "triples_scanned": triples_scanned,
+            "triples_imported": triples_imported,
+            "batch_size": batch_limit,
+            "nodes_written_in_batches": concept_nodes_written,
+            "relations_written_in_batches": relations_written,
+            "concept_count": concept_count,
+            "entity_linking": link_result,
         }
 
     def ensure_graph_schema(self) -> Dict[str, Any]:
@@ -793,7 +1041,9 @@ class GraphRAGService:
             "CREATE CONSTRAINT paper_paper_id_unique IF NOT EXISTS FOR (p:Paper) REQUIRE p.paper_id IS UNIQUE",
             "CREATE CONSTRAINT chunk_chunk_id_unique IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
             "CREATE CONSTRAINT entity_name_type_unique IF NOT EXISTS FOR (e:Entity) REQUIRE (e.name, e.type) IS UNIQUE",
+            "CREATE CONSTRAINT concept_uri_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.uri IS UNIQUE",
             "CREATE INDEX paper_year_index IF NOT EXISTS FOR (p:Paper) ON (p.year)",
+            "CREATE INDEX concept_normalized_name_index IF NOT EXISTS FOR (c:Concept) ON (c.normalized_name)",
         ]
 
         with self.driver.session() as session:
@@ -969,7 +1219,27 @@ class GraphRAGService:
             """
             session.run(context_query)
 
-        return {"upserted": count}
+        concept_candidates: List[Dict[str, str]] = []
+        for row in normalized_rows:
+            for entity in row.get("entities", []):
+                name = str(entity.get("name") or "").strip()
+                etype = str(entity.get("type") or "Unknown").strip() or "Unknown"
+                if name:
+                    concept_candidates.append({"name": name, "type": etype})
+            for rel in row.get("relations", []):
+                source = str(rel.get("source") or "").strip()
+                target = str(rel.get("target") or "").strip()
+                if source:
+                    concept_candidates.append({"name": source, "type": "Concept"})
+                if target:
+                    concept_candidates.append({"name": target, "type": "Concept"})
+
+        link_result = self.link_entities_to_concept(entity_rows=concept_candidates, only_unlinked=False)
+
+        return {
+            "upserted": count,
+            "aligned_concepts": link_result.get("linked", 0),
+        }
 
     def sync_from_mysql_knowledge_base(
         self,
@@ -1114,10 +1384,47 @@ class GraphRAGService:
         self.ensure_vector_index(force_recreate=False)
         return self.upsert_paper_chunks(rows)
 
+    def _expand_query_with_entities(self, query_text: str) -> str:
+        """调用 LLM 提取 query 中的核心实体，并给出中英文名称及同义词，返回拼接后的扩展查询文本。
+
+        若 LLM 调用失败或解析出错，降级为原始 query，保证检索链路不中断。
+        """
+        try:
+            response = ask_messages(
+                model=self.settings.llm_model,
+                temperature=0.1,
+                max_tokens=300,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE.format(query=query_text),
+                    },
+                ],
+            )
+            content = response.content.strip()
+            # 清理可能的 markdown code block
+            content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+            expanded_terms = json.loads(content)
+            if isinstance(expanded_terms, list) and expanded_terms:
+                valid_terms = [str(t).strip() for t in expanded_terms if t and str(t).strip()]
+                expanded = query_text + " " + " ".join(valid_terms)
+                print(f"[GraphRAG] ✓ 查询实体扩展成功: {valid_terms}")
+                return expanded
+        except (LLMError, json.JSONDecodeError, Exception) as e:
+            print(f"[GraphRAG] ⚠ 查询实体扩展失败，降级到原始查询: {e}")
+        return query_text
+
     def similarity_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
-        """基于向量索引执行相似度检索。"""
+        """基于向量索引执行相似度检索。检索前先通过 LLM 扩展 query 中的实体（中英文），再向量化检索。"""
         self._ensure_embedding_ready()
-        query_embedding = self._embed_text(query_text)
+
+        # === 查询实体扩展：调用 LLM 提取关键实体（含中英文同义词），拼接为增强查询文本 ===
+        expanded_query = self._expand_query_with_entities(query_text)
+        query_embedding = self._embed_text(expanded_query)
 
         vector_query = """
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
@@ -1185,9 +1492,15 @@ class GraphRAGService:
             ordered.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
             return ordered
 
-        keywords = _normalize_keywords(query_text)
+        keywords = _normalize_keywords(expanded_query)
         search_mode = "vector"
         all_rows: List[Dict[str, Any]] = []
+
+        # 修复：补充之前未定义的检索规模控制变量
+        effective_top_k = max(top_k, 3)
+        vector_fetch_k = min(effective_top_k * 2, 50)
+        expanded_fetch_k = min(effective_top_k * 3, 100)
+        normalized_paper_ids = None  # 当前接口不支持按论文过滤，设为 None
 
         with self.driver.session() as session:
             # 第一阶段：向量检索（保留用户给定 paper_ids 过滤）
@@ -1270,7 +1583,9 @@ class GraphRAGService:
         ]
         return {
             "query_text": query_text,
+            "expanded_query": expanded_query,
             "top_k": top_k,
+            "search_mode": search_mode,
             "results": response,
         }
 

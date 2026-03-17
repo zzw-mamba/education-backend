@@ -154,6 +154,18 @@ KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE = (
     "请返回可用于知识库全文检索的扩展词列表。"
 )
 
+GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT = (
+    "你是一个学术知识图谱检索扩展专家。"
+    "从用户查询中识别核心实体与概念，给出这些概念的中英文名称、常见缩写和同义表达（共3-8个扩展词）。"
+    "必须且仅返回 JSON 数组，例如：[\"图神经网络\", \"Graph Neural Network\", \"GNN\"]。"
+    "不要解释，不要编号，只返回纯 JSON 数组。"
+)
+
+GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE = (
+    "用户查询：{query}\n"
+    "请识别查询中的核心实体，并提供对应的中英文名称及常见同义词列表，用于向量检索扩展。"
+)
+
 __all__ = [
     "TEMPLATE_ANALYSE_PROMPT",
     "TEMPLATE_BUILD_USER_PROMPT_TEMPLATE",
@@ -171,4 +183,6 @@ __all__ = [
     "GRAPHRAG_RAG_QA_USER_PROMPT_TEMPLATE",
     "KNOWLEDGE_SEARCH_EXPANSION_SYSTEM_PROMPT",
     "KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE",
+    "GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT",
+    "GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE",
 ]
