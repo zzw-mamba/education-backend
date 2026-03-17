@@ -1,0 +1,8 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^\\(Get-Content \\.\\\\src\\\\CSO\\.3\\.5\\.nt \\| Select-String -Pattern 'label\\|prefLabel\\|sameAs\\|relatedEquivalent\\|superTopicOf\\|contributesTo' -SimpleMatch \\| Select-Object -First 30\\) \\| ForEach-Object \\{ \\$_\\.Line \\}$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}
