@@ -1,13 +1,15 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import models
 from database import engine, init_db
 import os
-from routers import ocr, db_routes, user, template, parsing, graphrag_routes
+from routers import ocr, db_routes, user, template, parsing, graphrag_routes, log
 import subprocess
 import asyncio
 from graphrag.graphrag_service import get_graphrag_service
@@ -57,6 +59,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Backend Service", version="0.1.0", lifespan=lifespan)
 
+analysis_results_dir = Path(__file__).resolve().parents[1] / "analysis_results"
+analysis_results_dir.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/analysis_results",
+    StaticFiles(directory=str(analysis_results_dir)),
+    name="analysis_results",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,6 +82,7 @@ app.include_router(user.router)
 app.include_router(template.router)
 app.include_router(parsing.router)
 app.include_router(graphrag_routes.router)
+app.include_router(log.router)
 
 class Item(BaseModel):
     name: str

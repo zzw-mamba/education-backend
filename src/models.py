@@ -30,17 +30,18 @@ class Log(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True, comment="日志ID")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="关联用户ID(可为空)")
     
-    action = Column(String(100), nullable=False, comment="操作类型 (如: login, upload_file, query)")
-    details = Column(Text, nullable=True, comment="操作详情(JSON或文本)")
-    ip_address = Column(String(50), nullable=True, comment="IP地址")
-    
+    template_id = Column(Integer, ForeignKey("templates.id"), comment="关联模板ID")
+    knowledge_ids = Column(String(255), nullable=False, comment="关联知识库ID列表，逗号分隔")
+    result_path = Column(Text, nullable=True, comment="生成结果")
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="记录时间")
 
     # 关系定义
     user = relationship("User", back_populates="logs")
+    template = relationship("Template", back_populates="logs")
 
     def __repr__(self):
-        return f"<Log(id={self.id}, action='{self.action}')>"
+        return f"<Log(id={self.id}, template_id={self.template_id})>"
     
     
 class Template(Base):
@@ -61,6 +62,7 @@ class Template(Base):
 
     # 关系定义
     user = relationship("User", backref="templates")
+    logs = relationship("Log", back_populates="template")
 
     def __repr__(self):
         return f"<Template(id={self.id}, user_id={self.user_id})>"
