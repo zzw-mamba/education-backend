@@ -1,5 +1,8 @@
 import ast
+import html
+from pathlib import Path
 from typing import List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
@@ -13,12 +16,15 @@ from prompt import (
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from database import get_db
-from models import Template, User
+from models import Template, User, Log
 from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
 from routers.user import get_current_user
 from utils.model import ask_messages, LLMError
 
 router = APIRouter(tags=["Template"])
+
+SERVER_ROOT_DIR = Path(__file__).resolve().parents[2]
+SUMMARY_EXPORT_DIR = Path(__file__).resolve().parents[2] / "analysis_results" / "summary_exports"
 
 class TemplateResponse(BaseModel):
     content: dict
@@ -71,8 +77,8 @@ def _format_document_chunks(chunks: List[dict], paper_citation_ids: dict) -> str
         citation_id = paper_citation_ids.get(paper_key)
         lines.append(
             (
-                f"[Chunk {idx}] [文献引用标记：{citation_id}] 文献ID={paper_id}，标题={chunk.get('title') or '未知'}，"
-                f"年份={chunk.get('year')}，chunk_index={chunk.get('chunk_index')}，相似度={score_text}\n"
+                f"[Chunk {idx}] [文献引用标记：{citation_id}]"
+                # f"年份={chunk.get('year')}，chunk_index={chunk.get('chunk_index')}，相似度={score_text}\n"
                 f"{chunk.get('text') or ''}"
             )
         )
@@ -150,6 +156,168 @@ def _format_graph_context(service, request: TemplateSummaryRequest, chunks: List
             graph_context_parts.append(f"[Paper {paper_id}]\n" + "\n\n".join(blocks))
 
     return "\n\n".join(graph_context_parts)
+
+
+def _build_knowledge_ids_for_log(search_result: dict, chunks: List[dict]) -> str:
+    """为日志构建 knowledge_ids 字段，优先使用检索返回的 paper_ids。"""
+    raw_ids = search_result.get("paper_ids") or []
+    unique_ids: List[str] = []
+
+    for item in raw_ids:
+        if isinstance(item, int):
+            item_str = str(item)
+            if item_str not in unique_ids:
+                unique_ids.append(item_str)
+
+    if not unique_ids:
+        for chunk in chunks:
+            paper_id = chunk.get("paper_id")
+            if isinstance(paper_id, int):
+                paper_id_str = str(paper_id)
+                if paper_id_str not in unique_ids:
+                    unique_ids.append(paper_id_str)
+
+    # logs.knowledge_ids 为 VARCHAR(255)，超长时进行截断避免写库失败。
+    return ",".join(unique_ids)[:255]
+
+
+def _ensure_summary_export_dir() -> Path:
+    SUMMARY_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return SUMMARY_EXPORT_DIR
+
+
+def _export_markdown_file(markdown_text: str, file_path: Path) -> None:
+    file_path.write_text(markdown_text, encoding="utf-8")
+
+
+def _export_docx_file(markdown_text: str, file_path: Path) -> None:
+    try:
+        from docx import Document
+    except ImportError as exc:
+        raise RuntimeError("缺少 python-docx 依赖，无法导出 Word") from exc
+
+    document = Document()
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            document.add_paragraph("")
+            continue
+
+        if line.startswith("### "):
+            document.add_heading(line[4:].strip(), level=3)
+        elif line.startswith("## "):
+            document.add_heading(line[3:].strip(), level=2)
+        elif line.startswith("# "):
+            document.add_heading(line[2:].strip(), level=1)
+        elif line.startswith("- "):
+            document.add_paragraph(line[2:].strip(), style="List Bullet")
+        else:
+            document.add_paragraph(line)
+
+    document.save(file_path)
+
+
+def _export_pdf_file(markdown_text: str, file_path: Path) -> None:
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except ImportError as exc:
+        raise RuntimeError("缺少 reportlab 依赖，无法导出 PDF") from exc
+
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+
+    doc = SimpleDocTemplate(
+        str(file_path),
+        pagesize=A4,
+        leftMargin=48,
+        rightMargin=48,
+        topMargin=54,
+        bottomMargin=54,
+    )
+
+    styles = getSampleStyleSheet()
+    body_style = ParagraphStyle(
+        "BodyCN",
+        parent=styles["Normal"],
+        fontName="STSong-Light",
+        fontSize=11,
+        leading=18,
+    )
+    h1_style = ParagraphStyle(
+        "H1CN",
+        parent=styles["Heading1"],
+        fontName="STSong-Light",
+        fontSize=18,
+        leading=24,
+    )
+    h2_style = ParagraphStyle(
+        "H2CN",
+        parent=styles["Heading2"],
+        fontName="STSong-Light",
+        fontSize=15,
+        leading=21,
+    )
+    h3_style = ParagraphStyle(
+        "H3CN",
+        parent=styles["Heading3"],
+        fontName="STSong-Light",
+        fontSize=13,
+        leading=18,
+    )
+
+    story = []
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            story.append(Spacer(1, 8))
+            continue
+
+        escaped_line = html.escape(line)
+        if line.startswith("### "):
+            story.append(Paragraph(html.escape(line[4:].strip()), h3_style))
+        elif line.startswith("## "):
+            story.append(Paragraph(html.escape(line[3:].strip()), h2_style))
+        elif line.startswith("# "):
+            story.append(Paragraph(html.escape(line[2:].strip()), h1_style))
+        elif line.startswith("- "):
+            bullet_text = html.escape(line[2:].strip())
+            story.append(Paragraph(f"• {bullet_text}", body_style))
+        else:
+            story.append(Paragraph(escaped_line, body_style))
+
+    if not story:
+        story.append(Paragraph("(Empty Markdown)", body_style))
+
+    doc.build(story)
+
+
+def _export_summary_bundle(markdown_text: str, result_id: str) -> dict:
+    export_dir = _ensure_summary_export_dir()
+    md_path = export_dir / f"{result_id}.md"
+    docx_path = export_dir / f"{result_id}.docx"
+    pdf_path = export_dir / f"{result_id}.pdf"
+
+    _export_markdown_file(markdown_text, md_path)
+    _export_docx_file(markdown_text, docx_path)
+    _export_pdf_file(markdown_text, pdf_path)
+
+    def _to_server_relative(path: Path) -> str:
+        try:
+            return path.relative_to(SERVER_ROOT_DIR).as_posix()
+        except ValueError:
+            # 异常场景回退，避免接口直接返回 Windows 绝对盘符。
+            return path.name
+
+    return {
+        "result_id": result_id,
+        "output_dir": _to_server_relative(export_dir),
+        "markdown_path": _to_server_relative(md_path),
+        "word_path": _to_server_relative(docx_path),
+        "pdf_path": _to_server_relative(pdf_path),
+    }
 
 @router.post("/template/build", response_model=TemplateResponse)
 def build_template(request: str):
@@ -300,6 +468,12 @@ def generate_summary_by_template(
             document_chunks=document_chunks,
             graph_relations=graph_relations,
         )
+        prompt_text += (
+            "\n\n输出格式要求：\n"
+            "1) 必须输出标准 Markdown。\n"
+            "2) 结构需包含标题、分节小标题和要点列表。\n"
+            "3) 引用请保留 [文献引用标记：x]，不要输出 JSON。"
+        )
 
         llm_result = ask_messages(
             messages=[
@@ -316,7 +490,42 @@ def generate_summary_by_template(
             },
         )
 
+        summary_markdown = (llm_result.content or "").strip()
+        if not summary_markdown:
+            raise HTTPException(status_code=502, detail="大模型返回为空，未生成有效 Markdown")
+
+        result_id = str(uuid4())
+        export_info = _export_summary_bundle(summary_markdown, result_id)
+
         graph_block_count = graph_relations.count("【实体】")
+        knowledge_ids = _build_knowledge_ids_for_log(search_result, chunks)
+        log_entry = Log(
+            user_id=current_user.id,
+            template_id=template.id,
+            knowledge_ids=knowledge_ids,
+            result_path=export_info["markdown_path"],
+        )
+        db.add(log_entry)
+        db.commit()
+        db.refresh(log_entry)
+        print({
+            "code": 200,
+            "message": "摘要生成成功",
+            "data": {
+                "template_id": template.id,
+                "template_name": template.name,
+                "query_text": request.query_text,
+                "result_id": result_id,
+                "summary": summary_markdown,
+                "summary_markdown": summary_markdown,
+                "retrieved_chunks": len(chunks),
+                "graph_context_blocks": graph_block_count,
+                "paper_ids": search_result.get("paper_ids"),
+                "citations": citations,
+                "log_id": log_entry.id,
+                "files": export_info,
+            },
+        })
         return {
             "code": 200,
             "message": "摘要生成成功",
@@ -324,11 +533,15 @@ def generate_summary_by_template(
                 "template_id": template.id,
                 "template_name": template.name,
                 "query_text": request.query_text,
-                "summary": (llm_result.content or "").strip(),
+                "result_id": result_id,
+                "summary": summary_markdown,
+                "summary_markdown": summary_markdown,
                 "retrieved_chunks": len(chunks),
                 "graph_context_blocks": graph_block_count,
                 "paper_ids": search_result.get("paper_ids"),
                 "citations": citations,
+                "log_id": log_entry.id,
+                "files": export_info,
             },
         }
     except LLMError as exc:

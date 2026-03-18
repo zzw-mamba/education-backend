@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
@@ -384,12 +384,15 @@ async def similarity_search(request: SearchRequest):
 @router.get("/related-papers/{paper_id}")
 async def related_papers(
     paper_id: int,
-    top_k: int = 10,
-    per_chunk_k: int = 8,
-    source_chunk_limit: int = 8,
-    evidence_limit: int = 3,
+    top_k: int = Query(default=10, ge=1, le=50, description="返回相关文章数量"),
+    per_chunk_k: int = Query(default=8, ge=1, le=30, description="每个源切片向量召回数量"),
+    source_chunk_limit: int = Query(default=8, ge=1, le=50, description="参与对比的源论文切片数量"),
+    evidence_limit: int = Query(default=3, ge=1, le=10, description="每篇候选论文返回的证据条数"),
+    concept_weight: float = Query(default=0.65, ge=0.0, le=1.0, description="概念对齐分权重"),
+    vector_weight: float = Query(default=0.35, ge=0.0, le=1.0, description="向量证据分权重"),
+    min_shared_concepts: int = Query(default=1, ge=0, le=20, description="最少共享概念数过滤阈值"),
 ):
-    """给定论文 ID，返回 GraphRAG 图谱中的相关文章。"""
+    """给定论文 ID，返回基于 Concept 对齐+向量证据的相关文章。"""
     service = _service_or_500()
     try:
         result = service.related_papers_by_id(
@@ -398,6 +401,9 @@ async def related_papers(
             per_chunk_k=per_chunk_k,
             source_chunk_limit=source_chunk_limit,
             evidence_limit=evidence_limit,
+            concept_weight=concept_weight,
+            vector_weight=vector_weight,
+            min_shared_concepts=min_shared_concepts,
         )
         return {"success": True, **result}
     except ValueError as e:

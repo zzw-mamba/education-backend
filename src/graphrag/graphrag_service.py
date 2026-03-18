@@ -517,6 +517,151 @@ class GraphRAGService:
         """确保摘要链路依赖已初始化。"""
         self._ensure_initialized()
 
+    def _to_english_term_for_concept(self, term: str) -> str:
+        """将实体术语转换为英文，便于与英文 CSO 概念匹配。"""
+        source = (term or "").strip()
+        if not source:
+            return source
+
+        # 已经是英文/数字/下划线/连字符时，直接返回。
+        if re.fullmatch(r"[A-Za-z0-9_\-\s]+", source):
+            return source
+
+        try:
+            response = ask_messages(
+                model=self.settings.llm_model,
+                temperature=0,
+                max_tokens=60,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a terminology translator for computer science ontology alignment. "
+                            "Translate the given term into concise English noun phrase. "
+                            "Return JSON only: {\"english_term\": \"...\"}."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": source,
+                    },
+                ],
+            )
+            content = response.content.strip()
+            content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+            parsed = json.loads(content)
+            english_term = str(parsed.get("english_term") or "").strip()
+            return english_term or source
+        except Exception:
+            return source
+
+    def _find_concept_candidates(
+        self,
+        entity_name: str,
+        normalized_name: Optional[str] = None,
+        limit: int = 12,
+    ) -> List[Dict[str, str]]:
+        """按英文关键词召回概念候选，供受限选择使用。"""
+        english_term = self._to_english_term_for_concept(entity_name)
+        normalized_english = _normalize_concept_term(english_term)
+        key = normalized_english or (normalized_name or "")
+        if not key:
+            return []
+
+        # 先尝试包含匹配，再尝试前缀匹配，最后退化到少量全表样本。
+        contains_key = key
+        prefix_key = key.split("_", 1)[0] if "_" in key else key
+        english_phrase = english_term.lower().strip()
+
+        with self.driver.session() as session:
+            rows = list(
+                session.run(
+                    """
+                    MATCH (c:Concept)
+                    WHERE c.normalized_name CONTAINS $contains_key
+                       OR $contains_key CONTAINS c.normalized_name
+                       OR c.normalized_name STARTS WITH $prefix_key
+                       OR toLower(coalesce(c.name, "")) CONTAINS $english_phrase
+                    RETURN c.uri AS uri, c.name AS name, c.normalized_name AS normalized_name
+                    LIMIT $limit
+                    """,
+                    {
+                        "contains_key": contains_key,
+                        "prefix_key": prefix_key,
+                        "english_phrase": english_phrase,
+                        "limit": int(limit),
+                    },
+                )
+            )
+
+            if not rows:
+                rows = list(
+                    session.run(
+                        """
+                        MATCH (c:Concept)
+                        RETURN c.uri AS uri, c.name AS name, c.normalized_name AS normalized_name
+                        LIMIT $limit
+                        """,
+                        {"limit": int(limit)},
+                    )
+                )
+
+        return [
+            {
+                "uri": str(r["uri"] or ""),
+                "name": str(r["name"] or ""),
+                "normalized_name": str(r["normalized_name"] or ""),
+            }
+            for r in rows
+            if r.get("normalized_name")
+        ]
+
+    def _select_concept_from_candidates_with_llm(
+        self,
+        entity_name: str,
+        entity_type: str,
+        candidates: List[Dict[str, str]],
+    ) -> Optional[str]:
+        """让 LLM 在给定候选中二选一，不允许输出候选外概念。"""
+        if not candidates:
+            return None
+
+        candidate_lines = []
+        for i, c in enumerate(candidates, start=1):
+            candidate_lines.append(f"{i}. name={c['name']} | normalized_name={c['normalized_name']}")
+
+        prompt = (
+            "你是知识图谱实体对齐助手。"
+            "请在候选概念列表中选择与实体最匹配的一个。"
+            "如果都不匹配，返回 null。\n"
+            "严格要求：只能返回 JSON 对象，格式为"
+            " {\"selected_normalized_name\": \"...\"} 或 {\"selected_normalized_name\": null}。\n"
+            f"实体: {entity_name} (type={entity_type})\n"
+            "候选概念:\n"
+            + "\n".join(candidate_lines)
+        )
+
+        try:
+            response = ask_messages(
+                model=self.settings.llm_model,
+                temperature=0,
+                max_tokens=120,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = response.content.strip()
+            content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+            obj = json.loads(content)
+            selected = obj.get("selected_normalized_name")
+            if selected is None:
+                return None
+            selected = str(selected).strip()
+            allowed = {c["normalized_name"] for c in candidates}
+            if selected in allowed:
+                return selected
+            return None
+        except Exception:
+            return None
+
     def _summarize_with_llm(self, context: str, stage: str = "final", section_hint: Optional[str] = None) -> str:
         """基于阶段化提示词调用 LLM 生成局部或最终摘要。"""
         self._ensure_summary_ready()
@@ -821,10 +966,18 @@ class GraphRAGService:
                     etype = str(item.get("type") or "Unknown").strip() or "Unknown"
                     if not name:
                         continue
-                    normalized_name = _normalize_concept_term(name)
+                    english_name = self._to_english_term_for_concept(name)
+                    normalized_name = _normalize_concept_term(english_name)
                     if not normalized_name:
                         continue
-                    rows_for_match.append({"name": name, "type": etype, "normalized_name": normalized_name})
+                    rows_for_match.append(
+                        {
+                            "name": name,
+                            "type": etype,
+                            "normalized_name": normalized_name,
+                            "english_name": english_name,
+                        }
+                    )
             else:
                 if only_unlinked:
                     fetch_query = """
@@ -843,10 +996,18 @@ class GraphRAGService:
                     etype = str(record["type"] or "Unknown").strip() or "Unknown"
                     if not name:
                         continue
-                    normalized_name = _normalize_concept_term(name)
+                    english_name = self._to_english_term_for_concept(name)
+                    normalized_name = _normalize_concept_term(english_name)
                     if not normalized_name:
                         continue
-                    rows_for_match.append({"name": name, "type": etype, "normalized_name": normalized_name})
+                    rows_for_match.append(
+                        {
+                            "name": name,
+                            "type": etype,
+                            "normalized_name": normalized_name,
+                            "english_name": english_name,
+                        }
+                    )
 
             dedup: Dict[str, Dict[str, str]] = {}
             for row in rows_for_match:
@@ -855,6 +1016,7 @@ class GraphRAGService:
             if not rows:
                 return {"linked": 0, "concepts": concept_count, "matched_candidates": 0}
 
+            # 第一阶段：标准化精确匹配
             link_query = """
             UNWIND $rows AS row
             MATCH (e:Entity {name: row.name, type: row.type})
@@ -863,10 +1025,78 @@ class GraphRAGService:
             RETURN count(*) AS linked
             """
             linked_row = session.run(link_query, {"rows": rows}).single()
-            linked_count = int(linked_row["linked"] if linked_row else 0)
+            linked_exact = int(linked_row["linked"] if linked_row else 0)
+
+            # 找出未命中的实体
+            unresolved_rows = list(
+                session.run(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (e:Entity {name: row.name, type: row.type})
+                    WHERE NOT (e)-[:ALIGNED_TO_CONCEPT]->(:Concept)
+                    RETURN row.name AS name, row.type AS type, row.normalized_name AS normalized_name
+                    """,
+                    {"rows": rows},
+                )
+            )
+
+        linked_llm = 0
+        unresolved_count = len(unresolved_rows)
+
+        # 第二阶段：候选召回 + LLM受限选择
+        for ur in unresolved_rows:
+            entity_name = str(ur["name"] or "").strip()
+            entity_type = str(ur["type"] or "Unknown").strip() or "Unknown"
+            normalized_name = str(ur["normalized_name"] or "").strip()
+            if not entity_name or not normalized_name:
+                continue
+
+            candidates = self._find_concept_candidates(
+                entity_name=entity_name,
+                normalized_name=normalized_name,
+                limit=12,
+            )
+            selected_normalized_name = self._select_concept_from_candidates_with_llm(
+                entity_name=entity_name,
+                entity_type=entity_type,
+                candidates=candidates,
+            )
+
+            if selected_normalized_name:
+                with self.driver.session() as session:
+                    llm_link_row = session.run(
+                        """
+                        MATCH (e:Entity {name: $name, type: $type})
+                        MATCH (c:Concept {normalized_name: $selected_normalized_name})
+                        MERGE (e)-[:ALIGNED_TO_CONCEPT {method: 'candidate_llm_select'}]->(c)
+                        RETURN count(*) AS linked
+                        """,
+                        {
+                            "name": entity_name,
+                            "type": entity_type,
+                            "selected_normalized_name": selected_normalized_name,
+                        },
+                    ).single()
+                linked_llm += int(llm_link_row["linked"] if llm_link_row else 0)
+            else:
+                # 第三阶段：显式标记未命中，便于后续人工审核或离线回填
+                with self.driver.session() as session:
+                    session.run(
+                        """
+                        MATCH (e:Entity {name: $name, type: $type})
+                        SET e.unmapped_concept = true,
+                            e.unmapped_concept_updated_at = datetime()
+                        """,
+                        {"name": entity_name, "type": entity_type},
+                    )
+
+        linked_count = linked_exact + linked_llm
 
         return {
             "linked": linked_count,
+            "linked_exact": linked_exact,
+            "linked_llm": linked_llm,
+            "unresolved": unresolved_count,
             "concepts": concept_count,
             "matched_candidates": len(rows),
         }
@@ -1418,7 +1648,12 @@ class GraphRAGService:
             print(f"[GraphRAG] ⚠ 查询实体扩展失败，降级到原始查询: {e}")
         return query_text
 
-    def similarity_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+    def similarity_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        paper_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
         """基于向量索引执行相似度检索。检索前先通过 LLM 扩展 query 中的实体（中英文），再向量化检索。"""
         self._ensure_embedding_ready()
 
@@ -1430,6 +1665,8 @@ class GraphRAGService:
         CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
         YIELD node, score
         OPTIONAL MATCH (p:Paper)-[:HAS_CHUNK]->(node)
+                WITH node, score, p
+                WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
         RETURN
           node.chunk_id AS chunk_id,
           node.text AS text,
@@ -1500,7 +1737,7 @@ class GraphRAGService:
         effective_top_k = max(top_k, 3)
         vector_fetch_k = min(effective_top_k * 2, 50)
         expanded_fetch_k = min(effective_top_k * 3, 100)
-        normalized_paper_ids = None  # 当前接口不支持按论文过滤，设为 None
+        normalized_paper_ids = [int(x) for x in (paper_ids or []) if x is not None] or None
 
         with self.driver.session() as session:
             # 第一阶段：向量检索（保留用户给定 paper_ids 过滤）
@@ -1511,6 +1748,7 @@ class GraphRAGService:
                         "index_name": self.settings.vector_index_name,
                         "top_k": vector_fetch_k,
                         "embedding": query_embedding,
+                        "paper_ids": normalized_paper_ids,
                     },
                 )
             )
@@ -1585,21 +1823,28 @@ class GraphRAGService:
             "query_text": query_text,
             "expanded_query": expanded_query,
             "top_k": top_k,
+            "paper_ids": normalized_paper_ids,
             "search_mode": search_mode,
             "results": response,
         }
 
-    def rag_search(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+    def rag_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        paper_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
         """检索相关 chunks 后调用本地 LLM 生成回答。"""
         self._ensure_ai_ready()
 
         # 1) 向量检索获取上下文
-        search_result = self.similarity_search(query_text, top_k=top_k)
+        search_result = self.similarity_search(query_text, top_k=top_k, paper_ids=paper_ids)
         chunks = search_result.get("results", [])
         if not chunks:
             return {
                 "query_text": query_text,
                 "top_k": top_k,
+                "paper_ids": paper_ids,
                 "answer": "未找到相关内容。",
                 "context_chunks": [],
             }
@@ -1623,8 +1868,176 @@ class GraphRAGService:
         return {
             "query_text": query_text,
             "top_k": top_k,
+            "paper_ids": paper_ids,
             "answer": answer,
             "context_chunks": [{"chunk_id": c.get("chunk_id"), "text": c.get("text"), "score": c.get("score")} for c in chunks],
+        }
+
+    def related_papers_by_id(
+        self,
+        paper_id: int,
+        top_k: int = 10,
+        per_chunk_k: int = 8,
+        source_chunk_limit: int = 8,
+        evidence_limit: int = 3,
+        concept_weight: float = 0.65,
+        vector_weight: float = 0.35,
+        min_shared_concepts: int = 1,
+    ) -> Dict[str, Any]:
+        """基于 Concept 对齐和向量证据返回相关文章。"""
+        self._ensure_ai_ready()
+
+        src_id = int(paper_id)
+        top_k = max(1, int(top_k))
+        per_chunk_k = max(1, int(per_chunk_k))
+        source_chunk_limit = max(1, int(source_chunk_limit))
+        evidence_limit = max(1, int(evidence_limit))
+        min_shared_concepts = max(0, int(min_shared_concepts))
+
+        with self.driver.session() as session:
+            exists_row = session.run(
+                "MATCH (p:Paper {paper_id: $paper_id}) RETURN p.title AS title, p.year AS year",
+                {"paper_id": src_id},
+            ).single()
+            if not exists_row:
+                raise ValueError(f"paper_id={src_id} 不存在，请先同步该论文到图数据库")
+
+            concept_rows = list(
+                session.run(
+                    """
+                    MATCH (src:Paper {paper_id: $paper_id})-[:HAS_ENTITY]->(:Entity)-[:ALIGNED_TO_CONCEPT]->(c:Concept)
+                    MATCH (cand:Paper)-[:HAS_ENTITY]->(:Entity)-[:ALIGNED_TO_CONCEPT]->(c)
+                    WHERE cand.paper_id <> $paper_id
+                    WITH cand, c
+                    ORDER BY cand.paper_id
+                    WITH cand,
+                         count(DISTINCT c) AS shared_concepts,
+                         collect(DISTINCT c.name)[0..$evidence_limit] AS concept_evidence
+                    WHERE shared_concepts >= $min_shared_concepts
+                    RETURN
+                      cand.paper_id AS paper_id,
+                      cand.title AS title,
+                      cand.year AS year,
+                      shared_concepts,
+                      concept_evidence
+                    ORDER BY shared_concepts DESC, cand.year DESC
+                    """,
+                    {
+                        "paper_id": src_id,
+                        "evidence_limit": evidence_limit,
+                        "min_shared_concepts": min_shared_concepts,
+                    },
+                )
+            )
+
+            vector_rows = list(
+                session.run(
+                    """
+                    MATCH (src:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(sc:Chunk)
+                    WHERE sc.embedding IS NOT NULL
+                    WITH sc
+                    ORDER BY sc.chunk_index ASC
+                    LIMIT $source_chunk_limit
+                    CALL db.index.vector.queryNodes($index_name, $per_chunk_k, sc.embedding)
+                    YIELD node, score
+                    MATCH (cand:Paper)-[:HAS_CHUNK]->(node)
+                    WHERE cand.paper_id <> $paper_id
+                    RETURN
+                      cand.paper_id AS paper_id,
+                      cand.title AS title,
+                      cand.year AS year,
+                      avg(score) AS avg_vector_score,
+                      max(score) AS max_vector_score,
+                      collect(DISTINCT node.chunk_id)[0..$evidence_limit] AS evidence_chunk_ids
+                    ORDER BY avg_vector_score DESC, max_vector_score DESC
+                    """,
+                    {
+                        "paper_id": src_id,
+                        "source_chunk_limit": source_chunk_limit,
+                        "index_name": self.settings.vector_index_name,
+                        "per_chunk_k": per_chunk_k,
+                        "evidence_limit": evidence_limit,
+                    },
+                )
+            )
+
+        merged: Dict[int, Dict[str, Any]] = {}
+
+        for row in concept_rows:
+            pid = int(row["paper_id"])
+            merged[pid] = {
+                "paper_id": pid,
+                "title": row.get("title"),
+                "year": row.get("year"),
+                "shared_concepts": int(row.get("shared_concepts") or 0),
+                "concept_evidence": row.get("concept_evidence") or [],
+                "avg_vector_score": 0.0,
+                "max_vector_score": 0.0,
+                "evidence_chunk_ids": [],
+            }
+
+        for row in vector_rows:
+            pid = int(row["paper_id"])
+            current = merged.get(pid)
+            if current is None:
+                current = {
+                    "paper_id": pid,
+                    "title": row.get("title"),
+                    "year": row.get("year"),
+                    "shared_concepts": 0,
+                    "concept_evidence": [],
+                    "avg_vector_score": 0.0,
+                    "max_vector_score": 0.0,
+                    "evidence_chunk_ids": [],
+                }
+                merged[pid] = current
+
+            current["avg_vector_score"] = float(row.get("avg_vector_score") or 0.0)
+            current["max_vector_score"] = float(row.get("max_vector_score") or 0.0)
+            current["evidence_chunk_ids"] = row.get("evidence_chunk_ids") or []
+
+        items = list(merged.values())
+        if not items:
+            return {
+                "paper_id": src_id,
+                "top_k": top_k,
+                "weights": {"concept": concept_weight, "vector": vector_weight},
+                "results": [],
+            }
+
+        max_shared = max(int(x.get("shared_concepts") or 0) for x in items) or 1
+        max_vec = max(float(x.get("avg_vector_score") or 0.0) for x in items) or 1.0
+
+        concept_w = max(0.0, float(concept_weight))
+        vector_w = max(0.0, float(vector_weight))
+        norm = concept_w + vector_w
+        if norm <= 0:
+            concept_w, vector_w = 0.65, 0.35
+            norm = 1.0
+        concept_w /= norm
+        vector_w /= norm
+
+        for x in items:
+            concept_score = float(x.get("shared_concepts") or 0) / max_shared
+            vector_score = float(x.get("avg_vector_score") or 0.0) / max_vec
+            x["concept_score"] = concept_score
+            x["vector_score"] = vector_score
+            x["hybrid_score"] = concept_w * concept_score + vector_w * vector_score
+
+        items.sort(
+            key=lambda x: (
+                float(x.get("hybrid_score") or 0.0),
+                int(x.get("shared_concepts") or 0),
+                float(x.get("avg_vector_score") or 0.0),
+            ),
+            reverse=True,
+        )
+
+        return {
+            "paper_id": src_id,
+            "top_k": top_k,
+            "weights": {"concept": concept_w, "vector": vector_w},
+            "results": items[:top_k],
         }
 
     def query_section_entities(self, paper_id: int, section: str) -> Dict[str, Any]:
