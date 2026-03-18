@@ -69,6 +69,114 @@ def _expand_search_terms_with_llm(query: str) -> List[str]:
 
     return list(terms)[:8]
 
+def rerank_documents_with_llm(query: str, docs: List[dict], top_k: int = 5) -> List[dict]:
+    """兜底降级方案：使用已有大语言模型作为 Reranker (LLM-as-a-Judge)"""
+    print(f"[Reranker - Fallback] 正在使用现有大模型(LLM)对 {len(docs)} 个文本进行深度语义重排...")
+    
+    system_prompt = """你是一个智能的搜索相关性重排专家。
+对于用户的查询（Query），你需要评估后续提供的几个文档片段（Doc）与查询的相关性。
+请给每个文档打分，分数范围在 0 到 100 之间。
+相关：直接回答了问题或包含关键信息，打 80-100 分。
+部分相关：有关联但没有直接回答，打 40-79 分。
+不相关：字面一样但语义反转，或者是无关内容，打 0-39 分。
+请你强制输出合法的 JSON 字典，键为文档ID（如 "doc_0"，"doc_1"），值为整数分数。不要输出任何除了 JSON 之外的其他分析或废话。
+示例格式：{"doc_0": 85, "doc_1": 10, "doc_2": 95}"""
+
+    docs_text = []
+    for i, d in enumerate(docs):
+        preview = str(d["content"])[:400].replace('\n', ' ')
+        docs_text.append(f"Doc ID: doc_{i}\nContent: {preview}")
+        
+    user_prompt = f"Query: {query}\n\nDocuments:\n" + "\n\n".join(docs_text)
+    
+    try:
+        llm_result = ask_messages(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=600,
+            temperature=0.1,
+        )
+        
+        reply_content = llm_result.content
+        import json
+        import re
+        
+        json_match = re.search(r'\{.*\}', reply_content, re.DOTALL)
+        if json_match:
+            score_dict = json.loads(json_match.group())
+            for i, d in enumerate(docs):
+                key = f"doc_{i}"
+                if key in score_dict:
+                    d["rerank_score"] = float(score_dict[key])
+                else:
+                    d["rerank_score"] = 0.0
+                    
+            reranked_docs = sorted(docs, key=lambda x: x.get("rerank_score", 0), reverse=True)
+            for d in reranked_docs:
+                d["score"] = d["rerank_score"]
+            return reranked_docs[:top_k]
+        else:
+            print("[Reranker - Fallback] 大模型未返回合法 JSON。")
+
+    except Exception as e:
+        print(f"[Reranker - Fallback] LLM 联合打分失败: {e}")
+        
+    print("[Reranker] 所有重排手段均失败，执行最终降级回退(返回原始排序)。")
+    return docs[:top_k]
+
+
+def rerank_documents(query: str, docs: List[dict], top_k: int = 5) -> List[dict]:
+    # ================= 优化 5：rerank重排 =================
+    """主引流入口：优先尝试专属 Reranker API，如果失败则走 LLM 降级"""
+    if not docs:
+        return docs
+        
+    api_key = os.getenv("RERANKER_API_KEY", "").strip('\"\'') 
+    api_base = os.getenv("RERANKER_API_BASE", "https://api.siliconflow.cn/v1/rerank").strip('\"\'')
+    model = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3").strip('\"\'')
+
+    if api_key and api_key != "your_siliconflow_api_key_here":
+        try:
+            print(f"[Reranker] 尝试请求专属重排模型API进行首选打分 ({model})...")
+            import requests
+            texts = [str(d["content"])[:512].replace('\n', ' ') for d in docs]
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": model,
+                "query": query,
+                "documents": texts
+            }
+            
+            resp = requests.post(api_base, json=payload, headers=headers, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                results.sort(key=lambda x: x["index"])
+                
+                for i, r in enumerate(results):
+                    docs[i]["rerank_score"] = float(r["relevance_score"])
+                    
+                reranked_docs = sorted(docs, key=lambda x: x.get("rerank_score", 0), reverse=True)
+                for d in reranked_docs:
+                    # 保留两位小数给前端
+                    d["score"] = round(d["rerank_score"], 4) 
+                print("[Reranker] 专属API重排成功！")
+                return reranked_docs[:top_k]
+            else:
+                print(f"[Reranker] 专属API返回错误: HTTP {resp.status_code} - {resp.text}，准备降级。")
+        except Exception as e:
+            print(f"[Reranker] 专属API调用异常: {e}，准备降级。")
+    else:
+        print("[Reranker] 专属API未配置或者为空，跳过API重排。")
+        
+    # 如果API失败，或者上面的逻辑没有return掉，则进入大模型打分
+    return rerank_documents_with_llm(query, docs, top_k)
+
 # --- 1. 测试连接 (保留并增强) ---
 @router.get("/db-test")
 def test_db_connection(db: Session = Depends(get_db)):
@@ -130,6 +238,7 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
     search_payload = " ".join([f'"{term}"' for term in search_terms])
     print(f"Expanded search terms: {search_terms}, payload: {search_payload}")
 
+    # 第 1 步：粗筛（高召回），多拿一些数据（20条），不管是不是字面上刚好撞车的
     sql = text("""
         SELECT id, title, authors, year, content,
             (
@@ -144,16 +253,26 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
 
     result = db.execute(sql, {"payload": search_payload}).all()
 
-    return [
+    # 将查询结果转成字典列表以便 Reranker 处理
+    docs_to_rerank = [
         {
             "id": r.id, 
             "title": r.title, 
             "score": round(r.score, 2),
             "authors": r.authors,
             "year": r.year,
-            "content": r.content[:200]  # 返回内容的前200字符作为预览
+            "content": r.content
         } for r in result
     ]
+
+    # 第 2 步：精排（高精度），用轻量级 LLM/重排模型剔除“字面相似语义相反”的内容，挑选 Top 5
+    final_docs = rerank_documents(query=q, docs=docs_to_rerank, top_k=5)
+
+    # 返回精选后的内容并裁剪预览
+    for doc in final_docs:
+        doc["content"] = doc["content"][:200]
+        
+    return final_docs
 
 
 @router.get("/knowledge/recommend")
