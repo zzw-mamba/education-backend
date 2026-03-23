@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Optional
 import requests
 import re
 import json
+import sqlite3
+import hashlib
 
 from neo4j import GraphDatabase
 
@@ -26,36 +28,134 @@ except Exception as e:
 
 
 class LocalEmbeddings:
-    """本地 Embedding 服务包装类，兼容 neo4j-graphrag 的 Embedder 接口。"""
+    """本地 Embedding 服务包装类，带有 SQLite 缓存和多文本批量请求优化。"""
+    # ================= 优化 6：Embedding 缓存 + 批量化请求 =================
 
-    def __init__(self, base_url: str, api_path: str, model: str, timeout: int = 30):
-        """初始化本地 Embedding 客户端配置。
-
-        Args:
-            base_url: Embedding 服务基础地址。
-            api_path: Embedding API 路径。
-            model: 使用的 embedding 模型名。
-            timeout: HTTP 请求超时时间（秒）。
-        """
+    def __init__(self, base_url: str, api_path: str, model: str, timeout: int = 60, cache_db_path: str = ".embedding_cache.db"):
+        """初始化本地 Embedding 客户端配置及持久化缓存。"""
         self.url = base_url.rstrip("/") + ("/" + api_path.lstrip("/") if api_path else "/v1/embeddings")
         self.model = model
         self.timeout = timeout
+        
+        # 将缓存文件放在后端根目录下，避免污染随处的结构
+        self.cache_db_path = os.path.join(os.path.dirname(__file__), "..", "..", cache_db_path)
+        self._init_cache()
+
+    def _init_cache(self):
+        """初始化 SQLite 缓存数据库"""
+        with sqlite3.connect(self.cache_db_path) as conn:
+            # 建立带最后访问时间的表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    hash TEXT PRIMARY KEY,
+                    vector TEXT,
+                    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # 无感容量控制触发器：超出 20 万条（约5GB）后，自动删掉最老的 10000 条
+            conn.execute('''
+                CREATE TRIGGER IF NOT EXISTS limit_cache_size 
+                AFTER INSERT ON embeddings
+                WHEN (SELECT COUNT(*) FROM embeddings) > 200000
+                BEGIN
+                    DELETE FROM embeddings 
+                    WHERE hash IN (
+                        SELECT hash FROM embeddings 
+                        ORDER BY last_accessed ASC 
+                        LIMIT 10000
+                    );
+                END;
+            ''')
+
+    def _get_hash(self, text: str) -> str:
+        """计算文本的 MD5 哈希"""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
 
     def embed_query(self, text: str) -> List[float]:
-        """嵌入单条文本，返回向量。"""
+        """嵌入单条文本，带有缓存命中机制。"""
+        text_hash = self._get_hash(text)
+        
+        # 1. 查缓存并更新访问时间
+        with sqlite3.connect(self.cache_db_path) as conn:
+            cursor = conn.execute("SELECT vector FROM embeddings WHERE hash = ?", (text_hash,))
+            row = cursor.fetchone()
+            if row:
+                conn.execute("UPDATE embeddings SET last_accessed = CURRENT_TIMESTAMP WHERE hash = ?", (text_hash,))
+                return json.loads(row[0])
+
+        # 2. 缓存未命中，请求 API
         payload = {"input": text, "model": self.model}
         resp = requests.post(self.url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
+        
         if "data" in data and data["data"] and "embedding" in data["data"][0]:
-            return data["data"][0]["embedding"]
-        if "embedding" in data:
-            return data["embedding"]
-        raise RuntimeError(f"本地 embedding 返回格式不支持: {data}")
+            vector = data["data"][0]["embedding"]
+        elif "embedding" in data:
+            vector = data["embedding"]
+        else:
+            raise RuntimeError(f"本地 embedding 返回格式不支持: {data}")
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """批量嵌入。"""
-        return [self.embed_query(t) for t in texts]
+        # 3. 写入缓存
+        with sqlite3.connect(self.cache_db_path) as conn:
+            conn.execute("INSERT OR IGNORE INTO embeddings (hash, vector) VALUES (?, ?)", 
+                         (text_hash, json.dumps(vector)))
+        return vector
+
+    def embed_documents(self, texts: List[str], batch_size: int = 50) -> List[List[float]]:
+        """批量嵌入优化：先筛选过滤已命中缓存的文本，剩余未命中的由一次 HTTP Post 请求批量投递打包。"""
+        results = [None] * len(texts)
+        uncached_indices = []
+        uncached_texts = []
+
+        # 1. 查询缓存，筛选出未命中的，并更新命中条目的访问时间
+        with sqlite3.connect(self.cache_db_path) as conn:
+            for i, text in enumerate(texts):
+                text_hash = self._get_hash(text)
+                cursor = conn.execute("SELECT vector FROM embeddings WHERE hash = ?", (text_hash,))
+                row = cursor.fetchone()
+                if row:
+                    results[i] = json.loads(row[0])       # 缓存命中，直接取出
+                    conn.execute("UPDATE embeddings SET last_accessed = CURRENT_TIMESTAMP WHERE hash = ?", (text_hash,))
+                else:
+                    uncached_indices.append(i)            # 缓存未命中，记录待充填的索引
+                    uncached_texts.append(text)
+
+        # 2. 对未命中的执行分批批量请求 (Batch Request) 
+        # (替代原有循环一个个发 HTTP 请求导致的高额 IO 瓶颈)
+        if uncached_texts:
+            for idx in range(0, len(uncached_texts), batch_size):
+                batch_texts = uncached_texts[idx:idx + batch_size]
+                batch_indices = uncached_indices[idx:idx + batch_size]
+                
+                # 直接传 String List 数组，主流兼容 openai 的推理后段（如 vLLM/SenseCore）已原生支持批量编码
+                payload = {"input": batch_texts, "model": self.model}
+                try:
+                    resp = requests.post(self.url, json=payload, timeout=self.timeout)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    embeddings_data = data.get("data", [])
+                    # 防御性排序：确保按 index 字段回填（多数服务端并发推流时会打乱流序）
+                    embeddings_data.sort(key=lambda x: x.get("index", 0))
+                    
+                    with sqlite3.connect(self.cache_db_path) as conn:
+                        for i, item in enumerate(embeddings_data):
+                            vector = item.get("embedding")
+                            original_index = batch_indices[i]
+                            results[original_index] = vector
+                            
+                            # 将批量获得的结果顺便持久化
+                            text_hash = self._get_hash(batch_texts[i])
+                            conn.execute("INSERT OR IGNORE INTO embeddings (hash, vector) VALUES (?, ?)", 
+                                         (text_hash, json.dumps(vector)))
+                except Exception as e:
+                    print(f"[Embedding 批量请求失败，自动降级为逐条请求]: {e}")
+                    # 超出最大并发 Token 限制容错机制：老老实实回退单条
+                    for i, ori_idx in enumerate(batch_indices):
+                        results[ori_idx] = self.embed_query(batch_texts[i])
+
+        return results
 
 
 def _normalize_section_name(raw_title: str) -> str:
