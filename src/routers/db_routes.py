@@ -6,10 +6,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import List
 import os
+from pydantic import BaseModel
 
 from database import get_db
 import models
 import re
+from routers.user import get_current_user
 from prompt import (
     KNOWLEDGE_SEARCH_EXPANSION_SYSTEM_PROMPT,
     KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE,
@@ -186,27 +188,30 @@ def test_db_connection(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
+class AddKnowledgeRequest(BaseModel):
+    title: str
+    content: str
+    category: str = None
+
 # --- 2. 添加词条 (核心：入库并自动提取标签) ---
 @router.post("/knowledge/add")
 def add_knowledge_entry(
-    title: str, 
-    content: str, 
-    user_id: int, 
-    category: str = None, 
+    req: AddKnowledgeRequest,
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
         # 1. 创建知识库主条目
         new_entry = models.KnowledgeBase(
-            user_id=user_id,
-            title=title,
-            content=content,
-            category=category
+            title=req.title,
+            content=req.content,
+            category=req.category,
+            user_id=current_user.id,
         )
         db.add(new_entry)
         db.flush()  # 获取自增 ID
 
-        keywords = jieba.analyse.extract_tags(f"{title} {title} {content}", topK=5)
+        keywords = jieba.analyse.extract_tags(f"{req.title} {req.title} {req.content}", topK=5)
 
         # 3. 关联标签
         for kw in keywords:
@@ -238,32 +243,37 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
     search_payload = " ".join([f'"{term}"' for term in search_terms])
     print(f"Expanded search terms: {search_terms}, payload: {search_payload}")
 
-    # 第 1 步：粗筛（高召回），多拿一些数据（20条），不管是不是字面上刚好撞车的
+    # 第 1 步：粗筛（高召回），为避免 MySQL 引擎对 MATCH 浮点数进行加权运算时出现 DOUBLE out of range 越界 Bug，
+    # 我们将单独获取两部分的分数，然后再在 Python 代码层进行归一化及加权运算和重新排序。
     sql = text("""
         SELECT id, title, authors, year, content,
-            (
-                (MATCH(title) AGAINST(:payload IN BOOLEAN MODE) * 5) + 
-                (MATCH(content) AGAINST(:payload IN BOOLEAN MODE) * 1)
-            ) AS score
+            MATCH(title) AGAINST(:payload IN BOOLEAN MODE) AS title_score,
+            MATCH(content) AGAINST(:payload IN BOOLEAN MODE) AS content_score
         FROM knowledge_base
         WHERE MATCH(title, content) AGAINST(:payload IN BOOLEAN MODE)
-        ORDER BY score DESC
-        LIMIT 20
+        ORDER BY MATCH(title, content) AGAINST(:payload IN BOOLEAN MODE) DESC
+        LIMIT 40
     """)
 
     result = db.execute(sql, {"payload": search_payload}).all()
 
-    # 将查询结果转成字典列表以便 Reranker 处理
-    docs_to_rerank = [
-        {
+    # 将查询结果转成字典列表并在此处计算实际加权分数，随后进行重新排序选出前 20 条
+    docs_to_rerank = []
+    for r in result:
+        # Title score 的权重为 5，content score 的权重为 1
+        weighted_score = (r.title_score * 5.0) + (r.content_score * 1.0)
+        docs_to_rerank.append({
             "id": r.id, 
             "title": r.title, 
-            "score": round(r.score, 2),
+            "score": round(weighted_score, 4),
             "authors": r.authors,
             "year": r.year,
             "content": r.content
-        } for r in result
-    ]
+        })
+    
+    # 根据归一化加权后的分数进行降序排序，取前 20 条喂给后续的精排模型
+    docs_to_rerank.sort(key=lambda x: x["score"], reverse=True)
+    docs_to_rerank = docs_to_rerank[:20]
 
     # 第 2 步：精排（高精度），用轻量级 LLM/重排模型剔除“字面相似语义相反”的内容，挑选 Top 5
     final_docs = rerank_documents(query=q, docs=docs_to_rerank, top_k=5)

@@ -547,6 +547,7 @@ def generate_summary_by_template(
     except LLMError as exc:
         raise HTTPException(status_code=503, detail=f"无法连接到大模型服务: {exc}")
     except Exception as exc:
+        import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"基于模板生成摘要失败: {exc}")
 
 
