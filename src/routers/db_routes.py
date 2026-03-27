@@ -201,13 +201,17 @@ def add_knowledge_entry(
     db: Session = Depends(get_db)
 ):
     try:
+        entry_kwargs = {
+            "title": req.title,
+            "content": req.content,
+            "category": req.category,
+        }
+        # 兼容历史库结构：只有模型存在 user_id 字段时才写入。
+        if hasattr(models.KnowledgeBase, "user_id"):
+            entry_kwargs["user_id"] = current_user.id
+
         # 1. 创建知识库主条目
-        new_entry = models.KnowledgeBase(
-            title=req.title,
-            content=req.content,
-            category=req.category,
-            user_id=current_user.id,
-        )
+        new_entry = models.KnowledgeBase(**entry_kwargs)
         db.add(new_entry)
         db.flush()  # 获取自增 ID
 
