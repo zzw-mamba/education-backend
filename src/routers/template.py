@@ -1,7 +1,7 @@
 import ast
 import html
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -38,6 +38,23 @@ class TemplateRequest(BaseModel):
     description: str = None
     example: str = None
     icon_path: str = None
+    labels: Optional[Union[List[str], str]] = None
+
+
+class TemplateUpdateRequest(BaseModel):
+    """更新模板请求模型"""
+    name: Optional[str] = None
+    prompt: Optional[str] = None
+    category: Optional[int] = None
+    description: Optional[str] = None
+    example: Optional[str] = None
+    icon_path: Optional[str] = None
+    labels: Optional[Union[List[str], str]] = None
+
+
+class TemplateDuplicateRequest(BaseModel):
+    """复制模板请求模型"""
+    name: Optional[str] = None
 
 
 class TemplateSummaryRequest(BaseModel):
@@ -64,6 +81,26 @@ def extract_first_brace_block(text: str) -> str:
     if start == -1 or end == -1 or start >= end:
         return text
     return text[start:end + 1]
+
+
+def _normalize_labels(labels: Optional[Union[List[str], str]]) -> Optional[str]:
+    """将标签输入统一转换为逗号分隔字符串，便于存储到 templates.labels。"""
+    if labels is None:
+        return None
+
+    if isinstance(labels, list):
+        cleaned = [str(item).strip() for item in labels if str(item).strip()]
+        return ",".join(cleaned) if cleaned else None
+
+    cleaned = [item.strip() for item in str(labels).split(",") if item.strip()]
+    return ",".join(cleaned) if cleaned else None
+
+
+def _split_labels(labels: Optional[str]) -> List[str]:
+    """将数据库中的逗号分隔 labels 转回前端使用的 tags 数组。"""
+    if not labels:
+        return []
+    return [item.strip() for item in labels.split(",") if item.strip()]
 
 
 def _format_document_chunks(chunks: List[dict], paper_citation_ids: dict) -> str:
@@ -380,7 +417,8 @@ def add_template(information: TemplateRequest, current_user: User = Depends(get_
             category=information.category,
             description=information.description,
             example=information.example,
-            icon_path=information.icon_path
+            icon_path=information.icon_path,
+            labels=_normalize_labels(information.labels),
         )
         
         db.add(new_template)
@@ -403,6 +441,153 @@ def add_template(information: TemplateRequest, current_user: User = Depends(get_
             status_code=400,
             detail=f"保存模板失败: {str(e)}"
         )
+
+
+@router.put("/template/{template_id}", status_code=200)
+def update_template(
+    template_id: int,
+    information: TemplateUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """更新当前用户自己的模板"""
+    template = (
+        db.query(Template)
+        .filter(Template.id == template_id, Template.user_id == current_user.id)
+        .first()
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限修改")
+
+    try:
+        if information.name is not None:
+            template.name = information.name
+        if information.prompt is not None:
+            template.prompt = information.prompt
+        if information.category is not None:
+            template.category = information.category
+        if information.description is not None:
+            template.description = information.description
+        if information.example is not None:
+            template.example = information.example
+        if information.icon_path is not None:
+            template.icon_path = information.icon_path
+        if information.labels is not None:
+            template.labels = _normalize_labels(information.labels)
+
+        db.commit()
+        db.refresh(template)
+
+        return {
+            "code": 200,
+            "message": "模板更新成功",
+            "data": {
+                "id": template.id,
+                "user_id": template.user_id,
+                "name": template.name,
+                "prompt": template.prompt,
+                "category": template.category,
+                "description": template.description,
+                "example": template.example,
+                "icon_path": template.icon_path,
+                "labels": template.labels,
+                "tags": _split_labels(template.labels),
+                "created_at": template.created_at.isoformat() if template.created_at else None,
+                "updated_at": template.updated_at.isoformat() if template.updated_at else None,
+            },
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"更新模板失败: {str(exc)}")
+
+
+@router.delete("/template/{template_id}", status_code=200)
+def delete_template(
+    template_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """删除当前用户自己的模板"""
+    template = (
+        db.query(Template)
+        .filter(Template.id == template_id, Template.user_id == current_user.id)
+        .first()
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限删除")
+
+    try:
+        db.delete(template)
+        db.commit()
+        return {
+            "code": 200,
+            "message": "模板删除成功",
+            "data": {"id": template_id},
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"删除模板失败: {str(exc)}")
+
+
+@router.post("/template/{template_id}/duplicate", status_code=200)
+def duplicate_template(
+    template_id: int,
+    payload: TemplateDuplicateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """复制用户可见模板（本人模板或公共模板）到当前用户名下"""
+    source_template = (
+        db.query(Template)
+        .filter(
+            Template.id == template_id,
+            or_(Template.user_id == current_user.id, Template.user_id == 0),
+        )
+        .first()
+    )
+    if source_template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限复制")
+
+    try:
+        duplicate_name = (payload.name or "").strip()
+        if not duplicate_name:
+            duplicate_name = f"{source_template.name} 副本"
+
+        new_template = Template(
+            user_id=current_user.id,
+            name=duplicate_name,
+            prompt=source_template.prompt,
+            category=source_template.category,
+            description=source_template.description,
+            example=source_template.example,
+            icon_path=source_template.icon_path,
+            labels=source_template.labels,
+        )
+        db.add(new_template)
+        db.commit()
+        db.refresh(new_template)
+
+        return {
+            "code": 200,
+            "message": "模板复制成功",
+            "data": {
+                "id": new_template.id,
+                "user_id": new_template.user_id,
+                "name": new_template.name,
+                "prompt": new_template.prompt,
+                "category": new_template.category,
+                "description": new_template.description,
+                "example": new_template.example,
+                "icon_path": new_template.icon_path,
+                "labels": new_template.labels,
+                "tags": _split_labels(new_template.labels),
+                "created_at": new_template.created_at.isoformat() if new_template.created_at else None,
+                "updated_at": new_template.updated_at.isoformat() if new_template.updated_at else None,
+            },
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"复制模板失败: {str(exc)}")
 
 
 @router.post("/template/{template_id}/summary", status_code=200)
@@ -583,6 +768,7 @@ def get_my_templates(
                     "example": template.example,
                     "icon_path": template.icon_path,
                     "labels": template.labels,
+                    "tags": _split_labels(template.labels),
                     "created_at": template.created_at.isoformat() if template.created_at else None,
                     "updated_at": template.updated_at.isoformat() if template.updated_at else None,
                 }
