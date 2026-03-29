@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from database import get_db
 from models import KnowledgeBase, Log
-import json
 import uuid
 import os
 import time
@@ -130,13 +129,9 @@ async def parse_material_batch(request_data: List[int], request: Request, db: Se
 
     log_entry = Log(
         user_id=user_id if isinstance(user_id, int) else None,
-        action="material_batch_analysis",
-        details=json.dumps({
-            "kb_ids": kb_ids,
-            "output_file": batch_result["file_path"],
-            "total": batch_result["total"]
-        }, ensure_ascii=False),
-        ip_address=request.client.host if request.client else "127.0.0.1"
+        template_id=None,
+        knowledge_ids=",".join(map(str, kb_ids)),
+        result_path=batch_result["file_path"],
     )
     db.add(log_entry)
     db.commit()

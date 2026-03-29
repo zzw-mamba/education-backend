@@ -21,6 +21,83 @@ from utils.model import ask_messages, LLMError
 router = APIRouter(tags=["Database"])
 
 
+def _resolve_existing_file_path(raw_path: str) -> str:
+    """Resolve a knowledge file path against common project roots."""
+    if not raw_path:
+        return ""
+
+    normalized = raw_path.replace("\\", os.sep).replace("/", os.sep)
+    candidates = []
+
+    # Absolute path as-is.
+    if os.path.isabs(normalized):
+        candidates.append(normalized)
+
+    # Resolve against several likely roots.
+    src_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    backend_root = os.path.dirname(src_root)
+    workspace_root = os.path.dirname(backend_root)
+
+    candidates.extend(
+        [
+            os.path.abspath(normalized),
+            os.path.join(src_root, normalized),
+            os.path.join(backend_root, normalized),
+            os.path.join(workspace_root, normalized),
+        ]
+    )
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def _fetch_tag_map_for_kb_ids(db: Session, kb_ids: list[int]) -> dict[int, set[str]]:
+    if not kb_ids:
+        return {}
+
+    sql = text(
+        """
+        SELECT r.kb_id, t.name
+        FROM kb_tag_relation r
+        JOIN tags t ON r.tag_id = t.id
+        WHERE r.kb_id IN :ids
+        """
+    )
+    rows = db.execute(sql, {"ids": tuple(kb_ids)}).all()
+
+    tag_map: dict[int, set[str]] = {}
+    for row in rows:
+        tag_map.setdefault(int(row.kb_id), set()).add(str(row.name))
+    return tag_map
+
+
+def _enrich_recommendations_with_tag_diff(
+    db: Session,
+    recommendation_docs: list[dict],
+    seed_kb_ids: list[int],
+) -> list[dict]:
+    if not recommendation_docs:
+        return recommendation_docs
+
+    seed_tag_map = _fetch_tag_map_for_kb_ids(db, seed_kb_ids)
+    seed_tags = set().union(*seed_tag_map.values()) if seed_tag_map else set()
+    candidate_ids = [int(doc["id"]) for doc in recommendation_docs]
+    candidate_tag_map = _fetch_tag_map_for_kb_ids(db, candidate_ids)
+
+    for doc in recommendation_docs:
+        candidate_tags = candidate_tag_map.get(int(doc["id"]), set())
+        same_tags = sorted(seed_tags.intersection(candidate_tags))
+        different_tags = sorted(candidate_tags.difference(seed_tags))
+
+        doc["common_tags"] = len(same_tags)
+        doc["same_tags"] = same_tags
+        doc["different_tags"] = different_tags
+
+    return recommendation_docs
+
+
 def _extract_first_json_array(text: str) -> str:
     start = text.find("[")
     end = text.rfind("]")
@@ -314,8 +391,8 @@ def recommend_similar_multiple(
     """)
     
     result = db.execute(sql, {"ids": tuple(kb_ids), "limit": limit}).all()
-    
-    return [
+
+    docs = [
         {
             "id": r.kb_id, 
             "title": r.title, 
@@ -326,6 +403,8 @@ def recommend_similar_multiple(
         for r in result
     ]
 
+    return _enrich_recommendations_with_tag_diff(db, docs, kb_ids)
+
 
 @router.get("/knowledge/recommend/{kb_id}")
 def recommend_similar_by_tags(
@@ -335,7 +414,7 @@ def recommend_similar_by_tags(
 ):
     """直接暴露 models.KBService 中基于 MySQL 标签重合度的单篇推荐逻辑。"""
     result = models.KBService.recommend_similar(db, kb_id, limit)
-    return [
+    docs = [
         {
             "id": row.id,
             "title": row.title,
@@ -345,6 +424,7 @@ def recommend_similar_by_tags(
         }
         for row in result
     ]
+    return _enrich_recommendations_with_tag_diff(db, docs, [kb_id])
 
 
 @router.get("/knowledge/content/{kb_id}")
@@ -372,15 +452,10 @@ def get_knowledge_file(file_id: int, db: Session = Depends(get_db)):
     if not kb_entry.file_path:
         raise HTTPException(status_code=404, detail="No file path associated with this entry")
         
-    # 3. 检查文件物理路径是否存在
-    # 如果路径是相对路径，确保主要是相对于运行目录
-    file_path = kb_entry.file_path
-    if not os.path.isabs(file_path):
-         # 如果是相对路径，可以尝试根据项目根目录拼接（视具体运行方式而定，暂时直接使用）
-         pass
-
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"File not found on disk: {file_path}")
+    # 3. 检查文件物理路径是否存在（兼容绝对/相对路径）
+    file_path = _resolve_existing_file_path(kb_entry.file_path)
+    if not file_path:
+        raise HTTPException(status_code=404, detail="File not found on disk")
         
     # 4. 准备文件名
     # 优先使用数据库中的 title 加上原文件的扩展名
