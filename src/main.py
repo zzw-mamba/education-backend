@@ -21,10 +21,9 @@ LOCAL_EMBEDDING_IP = os.getenv("LOCAL_EMBEDDING_IP")
 SSH_COMMAND = [
     "ssh", "-N", 
     "-p", "23686", 
-    "-o", "ServerAliveInterval=60", 
-    "-o", "StrictHostKeyChecking=no",
+    "-o", "ServerAliveInterval=30",
     "-L", "8080:" + LLM_IP + ":8000",
-    "-L", "9090:" + LOCAL_EMBEDDING_IP + ":8000",
+    "-L", "9091:" + LOCAL_EMBEDDING_IP + ":8000",
     "root@cci-proxy.cn-sh-01.sensecore.cn"
 ]
 
