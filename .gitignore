@@ -9,3 +9,5 @@
 /ocr_output
 .env
 .idea/
+database/
+*.db

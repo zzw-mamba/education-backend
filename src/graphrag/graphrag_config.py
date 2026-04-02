@@ -37,7 +37,7 @@ class GraphRAGSettings:
             embedding_dimensions=int(os.getenv("GRAPHRAG_EMBEDDING_DIMENSIONS", "4096")),
             similarity_fn=os.getenv("GRAPHRAG_SIMILARITY_FN", "cosine"),
             llm_model=os.getenv("GRAPHRAG_LLM_MODEL", "/mnt/chenbaiming/chenbaiming/Qwen3-30B-A3B-Instruct-2507"),
-            local_embedding_base_url=os.getenv("LOCAL_EMBEDDING_BASE_URL", "http://localhost:9090"),
+            local_embedding_base_url=os.getenv("LOCAL_EMBEDDING_BASE_URL", "http://localhost:9091"),
             local_embedding_api_path=os.getenv("LOCAL_EMBEDDING_API_PATH", "/v1/embeddings"),
             local_embedding_timeout=float(os.getenv("LOCAL_EMBEDDING_TIMEOUT", "30")),
         )

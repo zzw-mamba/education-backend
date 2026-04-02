@@ -1,10 +1,17 @@
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 import requests
 import re
 import json
 import sqlite3
 import hashlib
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else []
 
 from neo4j import GraphDatabase
 
@@ -326,7 +333,6 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
     
     # ================= 优化 2：语言自适应计算最佳切片结界 =================
     adapted_size, adapted_overlap = _optimize_chunk_params_by_language(text, chunk_size, chunk_overlap)
-    print(f"\n[DEBUG - 🌍 语言自适应切片] 检测总体文本度 {len(text)} 字符 -> 动态应用 chunk_size={adapted_size}, chunk_overlap={adapted_overlap}")
     chunk_size = adapted_size
     chunk_overlap = adapted_overlap
 
@@ -353,20 +359,12 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
         
         # 拦截逻辑：一旦章节名字包含了上述词汇，这章就完全不要了
         if any(kw in section_name.lower() for kw in ignore_keywords):
-            print(f"[DEBUG - 🚀 文本切片优化] 成功拦截并抛弃无用垃圾章节: {section_name}")
             continue
 
         content = section["content"]
         sub_chunks = _semantic_window_chunks(content, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        
-        print(f"\n[DEBUG - 文本切片] 章节: {section_name}")
-        print(f"[DEBUG - 文本切片] 原始文本长度: {len(content)} 字符")
-        print(f"[DEBUG - 文本切片] 切成了 {len(sub_chunks)} 块")
-        
+
         for i, chunk_text in enumerate(sub_chunks):
-            if i < 2: # 只打印前两块预览避免刷屏
-                print(f"   [块 {i}] 长度={len(chunk_text)}, 预览: {chunk_text[:50]}...")
-                
             output.append(
                 {
                     "section_name": section_name,
@@ -395,7 +393,6 @@ def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> L
         return []
 
     try:
-        print(f"\n[DEBUG - 节点关系提取 - 输入文本] 准备提取知识网 (前200字): {text[:200]}...")
         response = ask_messages(
             model=llm_model,
             temperature=0.1,
@@ -404,12 +401,16 @@ def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> L
                 {
                     "role": "system",
                     "content": (
-                        "你是一个高级知识图谱信息抽取专家。请从给定文本中提取核心的知识图谱三元组（实体-关系-实体）。\n"
-                        "【严格要求】：\n"
-                        "1. 实体必须是具体的专业术语、方法名、模型或核心研究概念。\n"
-                        "2. 关系必须简短、明确（例如：包含、应用于、提升了、基于、对比）。\n"
-                        "3. 只输出关键的 3-8 个三元组。\n"
-                        "4. 请务必严格以合法的 JSON 对象数组格式返回！要求完全符合如下格式，绝对不要加任何外部注释或 markdown 代码块：\n"
+                        "你是一位精通自然语言处理（NLP）的知识图谱构建专家。请从给定文本中提取核心知识三元组，构建高密度的学术/技术逻辑链条。\n"
+                        "【抽取逻辑规范】：\n"
+                        "1. 实体（Nodes）：仅限专业术语、算法模型、具体方法论或核心研究变量。禁止提取泛化的代词或非技术性名词。\n"
+                        "2. 关系（Edges）：必须是谓语性质的强关联词（如：实现于, 解决, 优于, 属于, 演化自）。避免使用模糊的“和”、“有关”。\n"
+                        "3. 密度要求：仅提取最具全局代表性的 5-8 个核心三元组，忽略琐碎的辅助信息。\n"
+                        "【输出格式要求】：\n"
+                        "1. 必须严格遵守 JSON 数组格式。\n"
+                        "2. 严禁包含任何 Markdown 代码块标识符（如 ```json）、解释性文字、前言或后缀。\n"
+                        "3. 确保输出内容可以直接被 json.loads() 解析。\n"
+                        "【json结构】：\n"
                         '[{"source": "实体1", "target": "实体2", "relation": "关系描述"}]'
                     ),
                 },
@@ -422,7 +423,6 @@ def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> L
         content = response.content.strip()
         # 清理可能存在的 markdown code block
         content = re.sub(r"^```[a-zA-Z]*\n|```$", "", content, flags=re.MULTILINE).strip()
-        print(f"[DEBUG - 三元组提取 - LLM回复]: {content}")
         
         if content.startswith('['):
             triplets = json.loads(content)
@@ -489,12 +489,7 @@ def resolve_and_clean_triplets(triplets: list, llm_model: Optional[str] = None) 
         unique_entities.add(tgt)
 
     # 2. 召唤大模型做智能表映射
-    print(f"   [实体消歧] 发现 {len(unique_entities)} 个独立实体变体，正在请求大模型合并同义词...")
     mapping = _dynamic_entity_mapping(list(unique_entities), llm_model=llm_model)
-    if mapping:
-        print(f"   [实体消歧] 大模型成功生成合并规则表！")
-        for k, v in mapping.items():
-            print(f"     > {k}  =>  {v}")
             
     # 3. 执行替换并合并重叠的关系
     resolved = []
@@ -568,11 +563,11 @@ class GraphRAGService:
                 f"原错误: {e}"
             ) from e
 
-        # ---- 使用本地 embedding 服务（localhost:9090）----
+        # ---- 使用本地 embedding 服务（localhost:9091）----
         if not self._has_local_embedding():
             raise RuntimeError(
                 "本地 embedding 服务未配置，请在 .env 中设置:\n"
-                "  LOCAL_EMBEDDING_BASE_URL=http://localhost:9090\n"
+                "  LOCAL_EMBEDDING_BASE_URL=http://localhost:9091\n"
                 "  LOCAL_EMBEDDING_API_PATH=/v1/embeddings\n"
                 "  GRAPHRAG_EMBEDDING_MODEL=<model_name>"
             )
@@ -616,6 +611,30 @@ class GraphRAGService:
     def _ensure_summary_ready(self) -> None:
         """确保摘要链路依赖已初始化。"""
         self._ensure_initialized()
+
+    def _extract_triplets_concurrently(self, texts: List[str]) -> List[List[Dict[str, str]]]:
+        """并发提取一组文本块的三元组，按输入顺序返回结果。"""
+        if not texts:
+            return []
+
+        max_workers = int(os.getenv("GRAPHRAG_TRIPLET_MAX_WORKERS", "4"))
+        max_workers = max(1, min(max_workers, len(texts)))
+        results: List[List[Dict[str, str]]] = [[] for _ in texts]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_extract_triplets_from_text, text, self.settings.llm_model): idx
+                for idx, text in enumerate(texts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result() or []
+                except Exception as e:
+                    print(f"[GraphRAG] ⚠ 并发三元组提取失败(块{idx})，已降级为空关系: {e}")
+                    results[idx] = []
+
+        return results
 
     def _to_english_term_for_concept(self, term: str) -> str:
         """将实体术语转换为英文，便于与英文 CSO 概念匹配。"""
@@ -731,14 +750,31 @@ class GraphRAGService:
             candidate_lines.append(f"{i}. name={c['name']} | normalized_name={c['normalized_name']}")
 
         prompt = (
-            "你是知识图谱实体对齐助手。"
-            "请在候选概念列表中选择与实体最匹配的一个。"
-            "如果都不匹配，返回 null。\n"
-            "严格要求：只能返回 JSON 对象，格式为"
-            " {\"selected_normalized_name\": \"...\"} 或 {\"selected_normalized_name\": null}。\n"
-            f"实体: {entity_name} (type={entity_type})\n"
-            "候选概念:\n"
-            + "\n".join(candidate_lines)
+            """
+            # Role
+            你是一位精通语义匹配和知识图谱构建的专家，擅长在复杂的命名变体中准确识别核心实体。
+
+            # Task
+            请判断给定的【目标实体】与【候选概念列表】中的哪一项指向同一个现实世界实体。
+
+            # Strategies
+            1. **语义对齐**：忽略缩写、大小写、标点符号的差异，关注核心语义。
+            2. **类型校验**：参考 (type=...) 信息，若候选词语义相近但类型冲突（如“苹果”公司 vs “苹果”水果），应判定为不匹配。
+            3. **唯一性原则**：仅选择最匹配的一项。若存在歧义或无强相关项，必须返回 null。
+
+            # Input
+            - 实体: {entity_name} (type={entity_type})
+            - 候选概念:
+            {candidate_lines}
+
+            # Constraints
+            - **严禁包含任何解释或开场白**。
+            - **必须**严格返回 JSON 格式：{"selected_normalized_name": "..."} 或 {"selected_normalized_name": null}。
+
+            # Examples
+            - 输入: 实体: 腾讯科技 (type=Company), 候选: [腾讯, 阿里巴巴, 腾讯公益] -> 输出: {"selected_normalized_name": "腾讯"}
+            - 输入: 实体: 苹果 (type=Fruit), 候选: [Apple Inc, 苹果公司] -> 输出: {"selected_normalized_name": null}
+            """
         )
 
         try:
@@ -1484,8 +1520,23 @@ class GraphRAGService:
         if not normalized_rows:
             return {"upserted": 0}
 
-        for row in normalized_rows:
-            row["embedding"] = self._embed_text(row["text"])
+        texts = [row["text"] for row in normalized_rows]
+        try:
+            batched_embeddings = self.embedder.embed_documents(texts)
+            if len(batched_embeddings) != len(normalized_rows):
+                raise RuntimeError(
+                    f"embedding 数量不匹配: expected={len(normalized_rows)}, actual={len(batched_embeddings)}"
+                )
+
+            for row, embedding in zip(normalized_rows, batched_embeddings):
+                if embedding is None:
+                    row["embedding"] = self._embed_text(row["text"])
+                else:
+                    row["embedding"] = embedding
+        except Exception as e:
+            print(f"[GraphRAG] ⚠ 批量 embedding 失败，降级为逐条生成: {e}")
+            for row in normalized_rows:
+                row["embedding"] = self._embed_text(row["text"])
 
         query = """
         UNWIND $rows AS row
@@ -1596,53 +1647,73 @@ class GraphRAGService:
 
             papers = query.all()
 
-            rows: List[Dict[str, Any]] = []
+            paper_payloads: List[Dict[str, Any]] = []
             for paper in papers:
-                content = paper.content or ""
+                tag_entities: List[Dict[str, str]] = []
+                try:
+                    for tag in (paper.tags or []):
+                        tag_name = (tag.name or "").strip()
+                        if tag_name:
+                            tag_entities.append({"name": tag_name, "type": "Tag"})
+                except Exception:
+                    pass
+
+                paper_payloads.append(
+                    {
+                        "paper_id": int(paper.id),
+                        "title": paper.title or "",
+                        "year": paper.year,
+                        "content": paper.content or "",
+                        "tag_entities": tag_entities,
+                    }
+                )
+
+            if not paper_payloads:
+                return {"papers": 0, "chunks": 0, "upserted": 0, "auto_extract_entities": auto_extract_entities}
+
+            self.ensure_vector_index(force_recreate=False)
+
+            def _process_single_paper(payload: Dict[str, Any]) -> Dict[str, Any]:
+                paper_id = int(payload["paper_id"])
+                title = str(payload.get("title") or "")
+                year = payload.get("year")
+                content = str(payload.get("content") or "")
+                paper_entities = list(payload.get("tag_entities") or [])
+
                 hierarchical_chunks = _hierarchical_semantic_chunking(
                     content,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
                 )
                 if not hierarchical_chunks:
-                    continue
-
-                paper_entities = []
-                try:
-                    for tag in (paper.tags or []):
-                        tag_name = (tag.name or "").strip()
-                        if tag_name:
-                            paper_entities.append({"name": tag_name, "type": "Tag"})
-                except Exception:
-                    pass
+                    return {"paper_id": paper_id, "chunks": 0, "upserted": 0, "aligned_concepts": 0}
 
                 key_entities = [entity["name"] for entity in paper_entities]
 
-                for chunk_item in hierarchical_chunks:
+                chunk_relations_list: List[List[Dict[str, str]]] = [[] for _ in hierarchical_chunks]
+                if auto_extract_entities:
+                    chunk_texts = [chunk_item["chunk_text"] for chunk_item in hierarchical_chunks]
+                    chunk_relations_list = self._extract_triplets_concurrently(chunk_texts)
+
+                rows: List[Dict[str, Any]] = []
+                for i, chunk_item in enumerate(hierarchical_chunks):
                     chunk_text = chunk_item["chunk_text"]
-                    
-                    # 自动从切片提取三元组，并将其节点合并为实体标签
                     chunk_entities = paper_entities.copy()
-                    chunk_relations = []
-                    if auto_extract_entities:
-                        try:
-                            extracted_triplets = _extract_triplets_from_text(chunk_text, self.settings.llm_model)
-                            chunk_relations = extracted_triplets
-                            
-                            # 将三元组中的所有节点也打平放入 entities 列表中
-                            for t in extracted_triplets:
-                                for en in [t["source"], t["target"]]:
-                                    if not any(e["name"] == en for e in chunk_entities):
-                                        chunk_entities.append({"name": en, "type": "Concept"})
-                        except Exception as e:
-                            print(f"[GraphRAG] ⚠ 自动三元组提取失败: {e}")
-                    
+                    chunk_relations = chunk_relations_list[i] if auto_extract_entities else []
+
+                    for t in chunk_relations:
+                        for en in [t.get("source"), t.get("target")]:
+                            if not en:
+                                continue
+                            if not any(e["name"] == en for e in chunk_entities):
+                                chunk_entities.append({"name": en, "type": "Concept"})
+
                     rows.append(
                         {
-                            "paper_id": paper.id,
-                            "title": paper.title or "",
-                            "year": paper.year,
-                            "chunk_id": f"{paper.id}_{chunk_item['chunk_index']}",
+                            "paper_id": paper_id,
+                            "title": title,
+                            "year": year,
+                            "chunk_id": f"{paper_id}_{chunk_item['chunk_index']}",
                             "text": chunk_text,
                             "index": chunk_item["chunk_index"],
                             "section_name": chunk_item["section_name"],
@@ -1652,16 +1723,49 @@ class GraphRAGService:
                         }
                     )
 
-            if not rows:
-                return {"papers": len(papers), "chunks": 0, "upserted": 0}
+                result = self.upsert_paper_chunks(rows)
+                return {
+                    "paper_id": paper_id,
+                    "chunks": len(rows),
+                    "upserted": int(result.get("upserted", 0)),
+                    "aligned_concepts": int(result.get("aligned_concepts", 0)),
+                }
 
-            self.ensure_vector_index(force_recreate=False)
-            result = self.upsert_paper_chunks(rows)
+            max_workers = int(os.getenv("GRAPHRAG_PAPER_MAX_WORKERS", "4"))
+            max_workers = max(1, min(max_workers, len(paper_payloads)))
+
+            total_chunks = 0
+            total_upserted = 0
+            total_aligned = 0
+            failed_papers: List[Dict[str, Any]] = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_paper = {
+                    executor.submit(_process_single_paper, payload): int(payload["paper_id"])
+                    for payload in paper_payloads
+                }
+
+                with tqdm(total=len(paper_payloads), desc="Sync MySQL->Neo4j", unit="paper") as pbar:
+                    for future in as_completed(future_to_paper):
+                        paper_id = future_to_paper[future]
+                        try:
+                            item = future.result()
+                            total_chunks += int(item.get("chunks", 0))
+                            total_upserted += int(item.get("upserted", 0))
+                            total_aligned += int(item.get("aligned_concepts", 0))
+                        except Exception as e:
+                            failed_papers.append({"paper_id": paper_id, "error": str(e)})
+                        finally:
+                            pbar.update(1)
+
             return {
-                "papers": len(papers),
-                "chunks": len(rows),
-                "upserted": result.get("upserted", 0),
+                "papers": len(paper_payloads),
+                "chunks": total_chunks,
+                "upserted": total_upserted,
+                "aligned_concepts": total_aligned,
+                "failed_papers": failed_papers,
                 "auto_extract_entities": auto_extract_entities,
+                "paper_workers": max_workers,
             }
         finally:
             db.close()
