@@ -6,10 +6,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import List
 import os
+from pydantic import BaseModel
 
 from database import get_db
 import models
 import re
+from routers.user import get_current_user
 from prompt import (
     KNOWLEDGE_SEARCH_EXPANSION_SYSTEM_PROMPT,
     KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE,
@@ -17,6 +19,83 @@ from prompt import (
 from utils.model import ask_messages, LLMError
 
 router = APIRouter(tags=["Database"])
+
+
+def _resolve_existing_file_path(raw_path: str) -> str:
+    """Resolve a knowledge file path against common project roots."""
+    if not raw_path:
+        return ""
+
+    normalized = raw_path.replace("\\", os.sep).replace("/", os.sep)
+    candidates = []
+
+    # Absolute path as-is.
+    if os.path.isabs(normalized):
+        candidates.append(normalized)
+
+    # Resolve against several likely roots.
+    src_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    backend_root = os.path.dirname(src_root)
+    workspace_root = os.path.dirname(backend_root)
+
+    candidates.extend(
+        [
+            os.path.abspath(normalized),
+            os.path.join(src_root, normalized),
+            os.path.join(backend_root, normalized),
+            os.path.join(workspace_root, normalized),
+        ]
+    )
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def _fetch_tag_map_for_kb_ids(db: Session, kb_ids: list[int]) -> dict[int, set[str]]:
+    if not kb_ids:
+        return {}
+
+    sql = text(
+        """
+        SELECT r.kb_id, t.name
+        FROM kb_tag_relation r
+        JOIN tags t ON r.tag_id = t.id
+        WHERE r.kb_id IN :ids
+        """
+    )
+    rows = db.execute(sql, {"ids": tuple(kb_ids)}).all()
+
+    tag_map: dict[int, set[str]] = {}
+    for row in rows:
+        tag_map.setdefault(int(row.kb_id), set()).add(str(row.name))
+    return tag_map
+
+
+def _enrich_recommendations_with_tag_diff(
+    db: Session,
+    recommendation_docs: list[dict],
+    seed_kb_ids: list[int],
+) -> list[dict]:
+    if not recommendation_docs:
+        return recommendation_docs
+
+    seed_tag_map = _fetch_tag_map_for_kb_ids(db, seed_kb_ids)
+    seed_tags = set().union(*seed_tag_map.values()) if seed_tag_map else set()
+    candidate_ids = [int(doc["id"]) for doc in recommendation_docs]
+    candidate_tag_map = _fetch_tag_map_for_kb_ids(db, candidate_ids)
+
+    for doc in recommendation_docs:
+        candidate_tags = candidate_tag_map.get(int(doc["id"]), set())
+        same_tags = sorted(seed_tags.intersection(candidate_tags))
+        different_tags = sorted(candidate_tags.difference(seed_tags))
+
+        doc["common_tags"] = len(same_tags)
+        doc["same_tags"] = same_tags
+        doc["different_tags"] = different_tags
+
+    return recommendation_docs
 
 
 def _extract_first_json_array(text: str) -> str:
@@ -155,27 +234,34 @@ def test_db_connection(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
+class AddKnowledgeRequest(BaseModel):
+    title: str
+    content: str
+    category: str = None
+
 # --- 2. 添加词条 (核心：入库并自动提取标签) ---
 @router.post("/knowledge/add")
 def add_knowledge_entry(
-    title: str, 
-    content: str, 
-    user_id: int, 
-    category: str = None, 
+    req: AddKnowledgeRequest,
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
+        entry_kwargs = {
+            "title": req.title,
+            "content": req.content,
+            "category": req.category,
+        }
+        # 兼容历史库结构：只有模型存在 user_id 字段时才写入。
+        if hasattr(models.KnowledgeBase, "user_id"):
+            entry_kwargs["user_id"] = current_user.id
+
         # 1. 创建知识库主条目
-        new_entry = models.KnowledgeBase(
-            user_id=user_id,
-            title=title,
-            content=content,
-            category=category
-        )
+        new_entry = models.KnowledgeBase(**entry_kwargs)
         db.add(new_entry)
         db.flush()  # 获取自增 ID
 
-        keywords = jieba.analyse.extract_tags(f"{title} {title} {content}", topK=5)
+        keywords = jieba.analyse.extract_tags(f"{req.title} {req.title} {req.content}", topK=5)
 
         # 3. 关联标签
         for kw in keywords:
@@ -207,17 +293,16 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
     search_payload = " ".join([f'"{term}"' for term in search_terms])
     print(f"Expanded search terms: {search_terms}, payload: {search_payload}")
 
-    # 第 1 步：粗筛（高召回），多拿一些数据（20条），不管是不是字面上刚好撞车的
+    # 第 1 步：粗筛（高召回），为避免 MySQL 引擎对 MATCH 浮点数进行加权运算时出现 DOUBLE out of range 越界 Bug，
+    # 我们将单独获取两部分的分数，然后再在 Python 代码层进行归一化及加权运算和重新排序。
     sql = text("""
         SELECT id, title, authors, year, content,
-            (
-                (MATCH(title) AGAINST(:payload IN BOOLEAN MODE) * 5) + 
-                (MATCH(content) AGAINST(:payload IN BOOLEAN MODE) * 1)
-            ) AS score
+            MATCH(title) AGAINST(:payload IN BOOLEAN MODE) AS title_score,
+            MATCH(content) AGAINST(:payload IN BOOLEAN MODE) AS content_score
         FROM knowledge_base
         WHERE MATCH(title, content) AGAINST(:payload IN BOOLEAN MODE)
-        ORDER BY score DESC
-        LIMIT 20
+        ORDER BY MATCH(title, content) AGAINST(:payload IN BOOLEAN MODE) DESC
+        LIMIT 40
     """)
 
     result = db.execute(sql, {"payload": search_payload}).all()
@@ -227,12 +312,15 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
         {
             "id": r.id, 
             "title": r.title, 
-            "score": round(r.score, 2),
+            "score": round(weighted_score, 4),
             "authors": r.authors,
             "year": r.year,
             "content": r.content
-        } for r in result
-    ]
+        })
+    
+    # 根据归一化加权后的分数进行降序排序，取前 20 条喂给后续的精排模型
+    docs_to_rerank.sort(key=lambda x: x["score"], reverse=True)
+    docs_to_rerank = docs_to_rerank[:20]
 
     # 第 2 步：精排（高精度），用轻量级 LLM/重排模型剔除“字面相似语义相反”的内容，挑选 Top 5
     final_docs = rerank_documents(query=q, docs=docs_to_rerank, top_k=10)
@@ -269,8 +357,8 @@ def recommend_similar_multiple(
     """)
     
     result = db.execute(sql, {"ids": tuple(kb_ids), "limit": limit}).all()
-    
-    return [
+
+    docs = [
         {
             "id": r.kb_id, 
             "title": r.title, 
@@ -281,6 +369,8 @@ def recommend_similar_multiple(
         for r in result
     ]
 
+    return _enrich_recommendations_with_tag_diff(db, docs, kb_ids)
+
 
 @router.get("/knowledge/recommend/{kb_id}")
 def recommend_similar_by_tags(
@@ -290,7 +380,7 @@ def recommend_similar_by_tags(
 ):
     """直接暴露 models.KBService 中基于 MySQL 标签重合度的单篇推荐逻辑。"""
     result = models.KBService.recommend_similar(db, kb_id, limit)
-    return [
+    docs = [
         {
             "id": row.id,
             "title": row.title,
@@ -300,6 +390,7 @@ def recommend_similar_by_tags(
         }
         for row in result
     ]
+    return _enrich_recommendations_with_tag_diff(db, docs, [kb_id])
 
 
 @router.get("/knowledge/content/{kb_id}")
@@ -327,15 +418,10 @@ def get_knowledge_file(file_id: int, db: Session = Depends(get_db)):
     if not kb_entry.file_path:
         raise HTTPException(status_code=404, detail="No file path associated with this entry")
         
-    # 3. 检查文件物理路径是否存在
-    # 如果路径是相对路径，确保主要是相对于运行目录
-    file_path = kb_entry.file_path
-    if not os.path.isabs(file_path):
-         # 如果是相对路径，可以尝试根据项目根目录拼接（视具体运行方式而定，暂时直接使用）
-         pass
-
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"File not found on disk: {file_path}")
+    # 3. 检查文件物理路径是否存在（兼容绝对/相对路径）
+    file_path = _resolve_existing_file_path(kb_entry.file_path)
+    if not file_path:
+        raise HTTPException(status_code=404, detail="File not found on disk")
         
     # 4. 准备文件名
     # 优先使用数据库中的 title 加上原文件的扩展名

@@ -1,10 +1,11 @@
 import ast
 import html
+import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel, Field
 from prompt import (
     TEMPLATE_ANALYSE_PROMPT,
@@ -15,7 +16,7 @@ from prompt import (
 )
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
-from database import get_db
+from database import get_db, SessionLocal
 from models import Template, User, Log
 from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
 from routers.user import get_current_user
@@ -25,6 +26,30 @@ router = APIRouter(tags=["Template"])
 
 SERVER_ROOT_DIR = Path(__file__).resolve().parents[2]
 SUMMARY_EXPORT_DIR = Path(__file__).resolve().parents[2] / "analysis_results" / "summary_exports"
+SUMMARY_JOB_STORE: dict[str, dict] = {}
+SUMMARY_JOB_LOCK = threading.Lock()
+
+SUMMARY_PROGRESS = {
+    "queued": 5,
+    "validating": 15,
+    "searching": 35,
+    "building_prompt": 55,
+    "generating": 78,
+    "exporting": 92,
+    "completed": 100,
+    "failed": 100,
+}
+
+SUMMARY_STATUS_MESSAGE = {
+    "queued": "任务已创建，等待执行",
+    "validating": "校验模板和参数中",
+    "searching": "正在检索相关文档片段",
+    "building_prompt": "正在构建摘要上下文",
+    "generating": "正在调用大模型生成摘要",
+    "exporting": "正在导出结果文件",
+    "completed": "摘要生成完成",
+    "failed": "摘要生成失败",
+}
 
 class TemplateResponse(BaseModel):
     content: dict
@@ -38,6 +63,23 @@ class TemplateRequest(BaseModel):
     description: str = None
     example: str = None
     icon_path: str = None
+    labels: Optional[Union[List[str], str]] = None
+
+
+class TemplateUpdateRequest(BaseModel):
+    """更新模板请求模型"""
+    name: Optional[str] = None
+    prompt: Optional[str] = None
+    category: Optional[int] = None
+    description: Optional[str] = None
+    example: Optional[str] = None
+    icon_path: Optional[str] = None
+    labels: Optional[Union[List[str], str]] = None
+
+
+class TemplateDuplicateRequest(BaseModel):
+    """复制模板请求模型"""
+    name: Optional[str] = None
 
 
 class TemplateSummaryRequest(BaseModel):
@@ -53,6 +95,196 @@ class TemplateSummaryRequest(BaseModel):
     neighbor_limit: int = Field(default=4, ge=0, le=20, description="图谱实体邻居数量")
     max_graph_papers: int = Field(default=3, ge=1, le=10, description="最多补充图谱上下文的论文数")
 
+
+def _update_summary_job(job_id: str, **fields) -> None:
+    with SUMMARY_JOB_LOCK:
+        job = SUMMARY_JOB_STORE.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+
+
+def _update_summary_job_stage(job_id: str, stage: str) -> None:
+    _update_summary_job(
+        job_id,
+        status="running" if stage not in {"completed", "failed"} else stage,
+        stage=stage,
+        progress=SUMMARY_PROGRESS.get(stage, 0),
+        message=SUMMARY_STATUS_MESSAGE.get(stage, ""),
+    )
+
+
+def _execute_summary_generation(
+    template_id: int,
+    request: TemplateSummaryRequest,
+    current_user: User,
+    db: Session,
+    job_id: Optional[str] = None,
+) -> dict:
+    if job_id:
+        _update_summary_job_stage(job_id, "validating")
+
+    template = (
+        db.query(Template)
+        .filter(
+            Template.id == template_id,
+            or_(Template.user_id == current_user.id, Template.user_id == 0),
+        )
+        .first()
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限访问")
+
+    if GRAPHRAG_IMPORT_ERROR is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"neo4j-graphrag 导入失败: {GRAPHRAG_IMPORT_ERROR}",
+        )
+
+    if job_id:
+        _update_summary_job_stage(job_id, "searching")
+
+    graphrag_service = get_graphrag_service()
+    search_result = graphrag_service.similarity_search(
+        request.query_text,
+        top_k=request.top_k,
+        paper_ids=request.paper_ids,
+    )
+    chunks = search_result.get("results", [])
+    if not chunks:
+        payload = {
+            "code": 200,
+            "message": "未检索到相关片段，无法生成摘要",
+            "data": {
+                "template_id": template.id,
+                "template_name": template.name,
+                "query_text": request.query_text,
+                "summary": "未检索到相关片段，请调整检索问题或放宽 paper_ids 范围。",
+                "retrieved_chunks": 0,
+                "graph_context_blocks": 0,
+            },
+        }
+        if job_id:
+            _update_summary_job_stage(job_id, "completed")
+            _update_summary_job(job_id, result=payload)
+        return payload
+
+    if job_id:
+        _update_summary_job_stage(job_id, "building_prompt")
+
+    citations, paper_citation_ids = _build_citation_mapping(chunks)
+    document_chunks = _format_document_chunks(chunks, paper_citation_ids)
+    graph_relations = _format_graph_context(graphrag_service, request, chunks)
+    if not graph_relations.strip():
+        graph_relations = "暂无可用图谱上下文。"
+
+    prompt_text = TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE.format(
+        template_prompt=template.prompt,
+        query_text=request.query_text,
+        focus_direction=request.focus_direction,
+        style=request.style,
+        word_limit=request.word_limit,
+        document_chunks=document_chunks,
+        graph_relations=graph_relations,
+    )
+    prompt_text += (
+        "\n\n输出格式要求：\n"
+        "1) 必须输出标准 Markdown。\n"
+        "2) 结构需包含标题、分节小标题和要点列表。\n"
+        "3) 引用请保留 [文献引用标记：x]，不要输出 JSON。"
+    )
+
+    if job_id:
+        _update_summary_job_stage(job_id, "generating")
+
+    llm_result = ask_messages(
+        messages=[
+            {"role": "system", "content": TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt_text},
+        ],
+        max_tokens=2200,
+        temperature=0.2,
+        top_p=0.8,
+        extra_payload={
+            "skip_special_tokens": False,
+            "spaces_between_special_tokens": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    summary_markdown = (llm_result.content or "").strip()
+    if not summary_markdown:
+        raise HTTPException(status_code=502, detail="大模型返回为空，未生成有效 Markdown")
+
+    if job_id:
+        _update_summary_job_stage(job_id, "exporting")
+
+    result_id = str(uuid4())
+    export_info = _export_summary_bundle(summary_markdown, result_id)
+
+    graph_block_count = graph_relations.count("【实体】")
+    knowledge_ids = _build_knowledge_ids_for_log(search_result, chunks)
+    log_entry = Log(
+        user_id=current_user.id,
+        template_id=template.id,
+        knowledge_ids=knowledge_ids,
+        result_path=export_info["markdown_path"],
+    )
+    db.add(log_entry)
+    db.commit()
+    db.refresh(log_entry)
+
+    payload = {
+        "code": 200,
+        "message": "摘要生成成功",
+        "data": {
+            "template_id": template.id,
+            "template_name": template.name,
+            "query_text": request.query_text,
+            "result_id": result_id,
+            "summary": summary_markdown,
+            "summary_markdown": summary_markdown,
+            "retrieved_chunks": len(chunks),
+            "graph_context_blocks": graph_block_count,
+            "paper_ids": search_result.get("paper_ids"),
+            "citations": citations,
+            "log_id": log_entry.id,
+            "files": export_info,
+        },
+    }
+    if job_id:
+        _update_summary_job_stage(job_id, "completed")
+        _update_summary_job(job_id, result=payload)
+    return payload
+
+
+def _run_summary_job(job_id: str, template_id: int, request_payload: dict, user_id: int) -> None:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在，无法执行摘要任务")
+
+        request = TemplateSummaryRequest(**request_payload)
+        _execute_summary_generation(
+            template_id=template_id,
+            request=request,
+            current_user=user,
+            db=db,
+            job_id=job_id,
+        )
+    except HTTPException as exc:
+        _update_summary_job_stage(job_id, "failed")
+        _update_summary_job(job_id, error=str(exc.detail))
+    except LLMError as exc:
+        _update_summary_job_stage(job_id, "failed")
+        _update_summary_job(job_id, error=f"无法连接到大模型服务: {exc}")
+    except Exception as exc:
+        _update_summary_job_stage(job_id, "failed")
+        _update_summary_job(job_id, error=f"基于模板生成摘要失败: {exc}")
+    finally:
+        db.close()
+
 def get_template_prompt(description: str) -> str:
     return TEMPLATE_DESCRIPTION_USER_PROMPT_TEMPLATE.format(description=description)
 
@@ -64,6 +296,26 @@ def extract_first_brace_block(text: str) -> str:
     if start == -1 or end == -1 or start >= end:
         return text
     return text[start:end + 1]
+
+
+def _normalize_labels(labels: Optional[Union[List[str], str]]) -> Optional[str]:
+    """将标签输入统一转换为逗号分隔字符串，便于存储到 templates.labels。"""
+    if labels is None:
+        return None
+
+    if isinstance(labels, list):
+        cleaned = [str(item).strip() for item in labels if str(item).strip()]
+        return ",".join(cleaned) if cleaned else None
+
+    cleaned = [item.strip() for item in str(labels).split(",") if item.strip()]
+    return ",".join(cleaned) if cleaned else None
+
+
+def _split_labels(labels: Optional[str]) -> List[str]:
+    """将数据库中的逗号分隔 labels 转回前端使用的 tags 数组。"""
+    if not labels:
+        return []
+    return [item.strip() for item in labels.split(",") if item.strip()]
 
 
 def _format_document_chunks(chunks: List[dict], paper_citation_ids: dict) -> str:
@@ -380,7 +632,8 @@ def add_template(information: TemplateRequest, current_user: User = Depends(get_
             category=information.category,
             description=information.description,
             example=information.example,
-            icon_path=information.icon_path
+            icon_path=information.icon_path,
+            labels=_normalize_labels(information.labels),
         )
         
         db.add(new_template)
@@ -405,6 +658,153 @@ def add_template(information: TemplateRequest, current_user: User = Depends(get_
         )
 
 
+@router.put("/template/{template_id}", status_code=200)
+def update_template(
+    template_id: int,
+    information: TemplateUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """更新当前用户自己的模板"""
+    template = (
+        db.query(Template)
+        .filter(Template.id == template_id, Template.user_id == current_user.id)
+        .first()
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限修改")
+
+    try:
+        if information.name is not None:
+            template.name = information.name
+        if information.prompt is not None:
+            template.prompt = information.prompt
+        if information.category is not None:
+            template.category = information.category
+        if information.description is not None:
+            template.description = information.description
+        if information.example is not None:
+            template.example = information.example
+        if information.icon_path is not None:
+            template.icon_path = information.icon_path
+        if information.labels is not None:
+            template.labels = _normalize_labels(information.labels)
+
+        db.commit()
+        db.refresh(template)
+
+        return {
+            "code": 200,
+            "message": "模板更新成功",
+            "data": {
+                "id": template.id,
+                "user_id": template.user_id,
+                "name": template.name,
+                "prompt": template.prompt,
+                "category": template.category,
+                "description": template.description,
+                "example": template.example,
+                "icon_path": template.icon_path,
+                "labels": template.labels,
+                "tags": _split_labels(template.labels),
+                "created_at": template.created_at.isoformat() if template.created_at else None,
+                "updated_at": template.updated_at.isoformat() if template.updated_at else None,
+            },
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"更新模板失败: {str(exc)}")
+
+
+@router.delete("/template/{template_id}", status_code=200)
+def delete_template(
+    template_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """删除当前用户自己的模板"""
+    template = (
+        db.query(Template)
+        .filter(Template.id == template_id, Template.user_id == current_user.id)
+        .first()
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限删除")
+
+    try:
+        db.delete(template)
+        db.commit()
+        return {
+            "code": 200,
+            "message": "模板删除成功",
+            "data": {"id": template_id},
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"删除模板失败: {str(exc)}")
+
+
+@router.post("/template/{template_id}/duplicate", status_code=200)
+def duplicate_template(
+    template_id: int,
+    payload: TemplateDuplicateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """复制用户可见模板（本人模板或公共模板）到当前用户名下"""
+    source_template = (
+        db.query(Template)
+        .filter(
+            Template.id == template_id,
+            or_(Template.user_id == current_user.id, Template.user_id == 0),
+        )
+        .first()
+    )
+    if source_template is None:
+        raise HTTPException(status_code=404, detail="模板不存在或无权限复制")
+
+    try:
+        duplicate_name = (payload.name or "").strip()
+        if not duplicate_name:
+            duplicate_name = f"{source_template.name} 副本"
+
+        new_template = Template(
+            user_id=current_user.id,
+            name=duplicate_name,
+            prompt=source_template.prompt,
+            category=source_template.category,
+            description=source_template.description,
+            example=source_template.example,
+            icon_path=source_template.icon_path,
+            labels=source_template.labels,
+        )
+        db.add(new_template)
+        db.commit()
+        db.refresh(new_template)
+
+        return {
+            "code": 200,
+            "message": "模板复制成功",
+            "data": {
+                "id": new_template.id,
+                "user_id": new_template.user_id,
+                "name": new_template.name,
+                "prompt": new_template.prompt,
+                "category": new_template.category,
+                "description": new_template.description,
+                "example": new_template.example,
+                "icon_path": new_template.icon_path,
+                "labels": new_template.labels,
+                "tags": _split_labels(new_template.labels),
+                "created_at": new_template.created_at.isoformat() if new_template.created_at else None,
+                "updated_at": new_template.updated_at.isoformat() if new_template.updated_at else None,
+            },
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"复制模板失败: {str(exc)}")
+
+
 @router.post("/template/{template_id}/summary", status_code=200)
 def generate_summary_by_template(
     template_id: int,
@@ -413,7 +813,29 @@ def generate_summary_by_template(
     db: Session = Depends(get_db),
 ):
     """根据模板 ID + GraphRAG 检索结果生成结构化全局摘要。"""
-    print(request)
+    try:
+        return _execute_summary_generation(
+            template_id=template_id,
+            request=request,
+            current_user=current_user,
+            db=db,
+        )
+    except LLMError as exc:
+        raise HTTPException(status_code=503, detail=f"无法连接到大模型服务: {exc}")
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"基于模板生成摘要失败: {exc}")
+
+
+@router.post("/template/{template_id}/summary-jobs", status_code=200)
+def create_summary_job(
+    template_id: int,
+    request: TemplateSummaryRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """创建摘要生成任务，前端可通过 job_id 轮询进度。"""
     template = (
         db.query(Template)
         .filter(
@@ -425,129 +847,66 @@ def generate_summary_by_template(
     if template is None:
         raise HTTPException(status_code=404, detail="模板不存在或无权限访问")
 
-    if GRAPHRAG_IMPORT_ERROR is not None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"neo4j-graphrag 导入失败: {GRAPHRAG_IMPORT_ERROR}",
-        )
-
-    try:
-        graphrag_service = get_graphrag_service()
-        search_result = graphrag_service.similarity_search(
-            request.query_text,
-            top_k=request.top_k,
-            paper_ids=request.paper_ids,
-        )
-        chunks = search_result.get("results", [])
-        if not chunks:
-            return {
-                "code": 200,
-                "message": "未检索到相关片段，无法生成摘要",
-                "data": {
-                    "template_id": template.id,
-                    "template_name": template.name,
-                    "query_text": request.query_text,
-                    "summary": "未检索到相关片段，请调整检索问题或放宽 paper_ids 范围。",
-                    "retrieved_chunks": 0,
-                    "graph_context_blocks": 0,
-                },
-            }
-
-        citations, paper_citation_ids = _build_citation_mapping(chunks)
-        document_chunks = _format_document_chunks(chunks, paper_citation_ids)
-        graph_relations = _format_graph_context(graphrag_service, request, chunks)
-        if not graph_relations.strip():
-            graph_relations = "暂无可用图谱上下文。"
-
-        prompt_text = TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE.format(
-            template_prompt=template.prompt,
-            query_text=request.query_text,
-            focus_direction=request.focus_direction,
-            style=request.style,
-            word_limit=request.word_limit,
-            document_chunks=document_chunks,
-            graph_relations=graph_relations,
-        )
-        prompt_text += (
-            "\n\n输出格式要求：\n"
-            "1) 必须输出标准 Markdown。\n"
-            "2) 结构需包含标题、分节小标题和要点列表。\n"
-            "3) 引用请保留 [文献引用标记：x]，不要输出 JSON。"
-        )
-
-        llm_result = ask_messages(
-            messages=[
-                {"role": "system", "content": TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt_text},
-            ],
-            max_tokens=2200,
-            temperature=0.2,
-            top_p=0.8,
-            extra_payload={
-                "skip_special_tokens": False,
-                "spaces_between_special_tokens": False,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-
-        summary_markdown = (llm_result.content or "").strip()
-        if not summary_markdown:
-            raise HTTPException(status_code=502, detail="大模型返回为空，未生成有效 Markdown")
-
-        result_id = str(uuid4())
-        export_info = _export_summary_bundle(summary_markdown, result_id)
-
-        graph_block_count = graph_relations.count("【实体】")
-        knowledge_ids = _build_knowledge_ids_for_log(search_result, chunks)
-        log_entry = Log(
-            user_id=current_user.id,
-            template_id=template.id,
-            knowledge_ids=knowledge_ids,
-            result_path=export_info["markdown_path"],
-        )
-        db.add(log_entry)
-        db.commit()
-        db.refresh(log_entry)
-        print({
-            "code": 200,
-            "message": "摘要生成成功",
-            "data": {
-                "template_id": template.id,
-                "template_name": template.name,
-                "query_text": request.query_text,
-                "result_id": result_id,
-                "summary": summary_markdown,
-                "summary_markdown": summary_markdown,
-                "retrieved_chunks": len(chunks),
-                "graph_context_blocks": graph_block_count,
-                "paper_ids": search_result.get("paper_ids"),
-                "citations": citations,
-                "log_id": log_entry.id,
-                "files": export_info,
-            },
-        })
-        return {
-            "code": 200,
-            "message": "摘要生成成功",
-            "data": {
-                "template_id": template.id,
-                "template_name": template.name,
-                "query_text": request.query_text,
-                "result_id": result_id,
-                "summary": summary_markdown,
-                "summary_markdown": summary_markdown,
-                "retrieved_chunks": len(chunks),
-                "graph_context_blocks": graph_block_count,
-                "paper_ids": search_result.get("paper_ids"),
-                "citations": citations,
-                "log_id": log_entry.id,
-                "files": export_info,
-            },
+    job_id = str(uuid4())
+    with SUMMARY_JOB_LOCK:
+        SUMMARY_JOB_STORE[job_id] = {
+            "job_id": job_id,
+            "user_id": current_user.id,
+            "template_id": template_id,
+            "status": "queued",
+            "stage": "queued",
+            "progress": SUMMARY_PROGRESS["queued"],
+            "message": SUMMARY_STATUS_MESSAGE["queued"],
+            "result": None,
+            "error": None,
         }
-    except LLMError as exc:
-        raise HTTPException(status_code=503, detail=f"无法连接到大模型服务: {exc}")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"基于模板生成摘要失败: {exc}")
+
+    background_tasks.add_task(
+        _run_summary_job,
+        job_id,
+        template_id,
+        request.dict(),
+        current_user.id,
+    )
+
+    return {
+        "code": 200,
+        "message": "摘要任务创建成功",
+        "data": {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "progress": SUMMARY_PROGRESS["queued"],
+            "message": SUMMARY_STATUS_MESSAGE["queued"],
+        },
+    }
+
+
+@router.get("/template/summary-jobs/{job_id}", status_code=200)
+def get_summary_job_status(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """查询摘要任务状态。"""
+    with SUMMARY_JOB_LOCK:
+        job = SUMMARY_JOB_STORE.get(job_id)
+
+    if job is None or job.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="摘要任务不存在")
+
+    return {
+        "code": 200,
+        "message": "查询成功",
+        "data": {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "stage": job["stage"],
+            "progress": job["progress"],
+            "message": job.get("message"),
+            "result": job.get("result"),
+            "error": job.get("error"),
+        },
+    }
 
 
 @router.get("/template/my", status_code=200)
@@ -582,6 +941,7 @@ def get_my_templates(
                     "example": template.example,
                     "icon_path": template.icon_path,
                     "labels": template.labels,
+                    "tags": _split_labels(template.labels),
                     "created_at": template.created_at.isoformat() if template.created_at else None,
                     "updated_at": template.updated_at.isoformat() if template.updated_at else None,
                 }

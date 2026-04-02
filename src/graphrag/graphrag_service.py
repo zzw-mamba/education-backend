@@ -558,7 +558,7 @@ class GraphRAGService:
                 f"无法连接到 Neo4j。请检查:\n"
                 f"  1. Neo4j Desktop Database 是否已启动（绿色指示灯）\n"
                 f"  2. 地址: {self.settings.neo4j_uri}\n"
-                f"  3. 用户名/密码: {self.settings.neo4j_user}\n"
+                f"  3. 用户名/密码: {self.settings.neo4j_user}/{self.settings.neo4j_password}\n"
                 f"  4. 若路径无效，更新 NEO4J_URI 后重启应用\n"
                 f"原错误: {e}"
             ) from e

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Header
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -77,7 +77,7 @@ class UserLogin(BaseModel):
     password: str
 
 class UserUpdate(BaseModel):
-    user_id: int
+    username: str | None = None
     email: EmailStr | None = None
 
 class ChangePassword(BaseModel):
@@ -138,17 +138,39 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
     }
 
 @router.put("/update", status_code=status.HTTP_200_OK)
-def update_user_info(user_update: UserUpdate, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == user_update.user_id).first()
+def update_user_info(
+    user_update: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == current_user.id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
+    if user_update.username is not None:
+        next_username = user_update.username.strip()
+        if len(next_username) < 2:
+            raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
+        conflict = db.query(User).filter(User.username == next_username, User.id != db_user.id).first()
+        if conflict:
+            raise HTTPException(status_code=400, detail="Username already registered")
+        db_user.username = next_username
+
     if user_update.email is not None:
-        db_user.email = user_update.email
-    
+        next_email = user_update.email.strip()
+        conflict = db.query(User).filter(User.email == next_email, User.id != db_user.id).first()
+        if conflict:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        db_user.email = next_email
+
     db.commit()
     db.refresh(db_user)
-    return {"id": db_user.id, "username": db_user.username, "email": db_user.email}
+    return {
+        "id": db_user.id,
+        "username": db_user.username,
+        "email": db_user.email,
+        "status": db_user.status,
+    }
 
 @router.post("/change-password", status_code=status.HTTP_200_OK)
 def change_password(data: ChangePassword, db: Session = Depends(get_db)):
@@ -175,5 +197,6 @@ def get_current_user_info(current_user: User = Depends(get_current_user)):
     return {
         "id": current_user.id,
         "username": current_user.username,
-        "email": current_user.email
+        "email": current_user.email,
+        "status": current_user.status,
     }
