@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -7,6 +8,7 @@ from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERRO
 
 
 router = APIRouter(prefix="/api/graphrag", tags=["graphrag"])
+logger = logging.getLogger(__name__)
 
 
 class EntityInput(BaseModel):
@@ -33,6 +35,22 @@ class SearchRequest(BaseModel):
     query_text: str
     top_k: int = Field(default=5, ge=1, le=30)
     paper_ids: Optional[List[int]] = Field(default=None, description="限定检索范围的论文 ID 列表")
+    session_scope: Optional[str] = Field(default=None, description="临时 OCR 会话作用域")
+    include_global: bool = Field(default=False, description="是否在作用域检索外再补充全库检索")
+
+
+class TempOCRUpsertRequest(BaseModel):
+    title: str = Field(..., description="OCR 文档标题")
+    content: str = Field(..., description="OCR 识别出的 Markdown/文本内容")
+    session_scope: Optional[str] = Field(default=None, description="临时会话标识，不传则后端生成")
+    ttl_hours: int = Field(default=24, ge=1, le=168, description="临时数据存活时长（小时）")
+    chunk_size: int = Field(default=500, ge=100, le=4000)
+    chunk_overlap: int = Field(default=50, ge=0, le=1000)
+    auto_extract_entities: bool = Field(default=True, description="是否自动抽取实体并构建关系")
+
+
+class TempScopeCleanupRequest(BaseModel):
+    session_scope: str = Field(..., description="待清理的临时 OCR 会话作用域")
 
 
 class CreateIndexRequest(BaseModel):
@@ -300,6 +318,68 @@ async def sync_from_mysql(request: SyncFromMySQLRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
+
+@router.post("/upsert-temp-ocr")
+async def upsert_temp_ocr(request: TempOCRUpsertRequest):
+    """将 OCR 文本写入临时图谱作用域，不落正式 MySQL 知识库。"""
+    service = _service_or_500()
+    try:
+        result = service.upsert_temp_ocr_content(
+            title=request.title,
+            content=request.content,
+            session_scope=request.session_scope,
+            ttl_hours=request.ttl_hours,
+            chunk_size=request.chunk_size,
+            chunk_overlap=request.chunk_overlap,
+            auto_extract_entities=request.auto_extract_entities,
+        )
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/cleanup-temp-scope")
+async def cleanup_temp_scope(request: TempScopeCleanupRequest):
+    """按会话作用域清理临时 OCR 图数据。"""
+    service = _service_or_500()
+    try:
+        logger.info("[cleanup-temp-scope] request scope=%s", request.session_scope)
+        result = service.cleanup_temp_scope(session_scope=request.session_scope)
+        logger.info(
+            "[cleanup-temp-scope] result scope=%s deleted_chunks=%s deleted_papers=%s deleted_orphan_entities=%s",
+            result.get("session_scope"),
+            result.get("deleted_chunks", 0),
+            result.get("deleted_papers", 0),
+            result.get("deleted_orphan_entities", 0),
+        )
+        return {"success": True, **result}
+    except ValueError as e:
+        logger.warning("[cleanup-temp-scope] invalid scope=%s detail=%s", request.session_scope, str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("[cleanup-temp-scope] failed scope=%s", request.session_scope)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/cleanup-temp-expired")
+async def cleanup_temp_expired():
+    """清理所有已过期临时 OCR 图数据。"""
+    service = _service_or_500()
+    try:
+        logger.info("[cleanup-temp-expired] request")
+        result = service.cleanup_expired_temp_data()
+        logger.info(
+            "[cleanup-temp-expired] result now=%s deleted_chunks=%s deleted_papers=%s deleted_orphan_entities=%s",
+            result.get("now"),
+            result.get("deleted_chunks", 0),
+            result.get("deleted_papers", 0),
+            result.get("deleted_orphan_entities", 0),
+        )
+        return {"success": True, **result}
+    except Exception as e:
+        logger.exception("[cleanup-temp-expired] failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
 @router.post("/graph-refined-context")
 async def graph_refined_context(request: PaperSummaryRequest):
     """
@@ -376,6 +456,8 @@ async def similarity_search(request: SearchRequest):
             request.query_text,
             top_k=request.top_k,
             paper_ids=request.paper_ids,
+            session_scope=request.session_scope,
+            include_global=request.include_global,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -432,6 +514,8 @@ async def rag_search(request: SearchRequest):
             request.query_text,
             top_k=request.top_k,
             paper_ids=request.paper_ids,
+            session_scope=request.session_scope,
+            include_global=request.include_global,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
