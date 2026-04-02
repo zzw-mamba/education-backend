@@ -52,24 +52,34 @@ TEMPLATE_RAG_SUMMARY_SYSTEM_PROMPT = (
 )
 
 TEMPLATE_RAG_SUMMARY_USER_PROMPT_TEMPLATE = (
-    "【模板框架】\n{template_prompt}\n\n"
-    "【用户问题/主题】\n{query_text}\n\n"
-    "【聚焦方向】\n{focus_direction}\n\n"
-    "【文风要求】\n{style}\n\n"
-    "【篇幅要求】\n{word_limit}\n\n"
-    "【文档片段集合（GraphRAG召回）】\n{document_chunks}\n\n"
-    "【实体图谱关联（GraphRAG图上下文）】\n{graph_relations}\n\n"
-    "【引用溯源要求】\n"
-    "在摘要中引用或参考任何上述文档片段时，请用方括号标记引用编号，例如 [1]、[2]。\n"
-    "编号对应文档片段中的文献引用标记（如 [文献引用标记：1] 对应 [1]）。\n"
-    "同一篇文献即使出现多个 Chunk，也必须使用同一个引用编号，不可重复分配新编号。\n"
-    "多个引用可并列，如 [1][2]。不需要在正文末尾添加参考文献列表。\n\n"
-    "请按以下段落结构输出一篇连贯概述，不要输出标题和要点列表：\n"
-    "1) 第一段：宏观主旨概述（引出全貌）\n"
-    "2) 第二段：实体枢纽与跨片段共性（图谱洞察）\n"
-    "3) 第三段：全局核心结论（3-5个关键结论，用连接词串联）\n"
-    "4) 第四段：全局洞察与收尾（趋势与关键变量）\n"
-    "要求：避免机械罗列，保持学术/商业报告式客观表达，重视引用标记的精准追踪。"
+    """
+    # Role
+    你是一个学术综述与信息合成专家，擅长从异构的图谱信息中提取核心精华，生成逻辑高度致密的学术摘要。
+
+    # Inputs
+    - **核心主题**：{query_text}
+    - **聚焦方向**：{focus_direction}
+    - **篇幅限制**：{word_limit}
+    - **数据源（片段）**：{document_chunks}
+    - **数据源（关系）**：{graph_relations}
+
+    # Task
+    请基于上述召回的片段与图谱关系，合成一篇逻辑连贯的深度摘要。摘要需体现【聚焦方向】中的核心关切，并揭示不同文档片段间的共性与关联。
+
+    # Citation Requirements (STRICT)
+    - **唯一溯源标准**：引用任何观点或事实时，必须严格使用文档片段中标记的 `[文献引用标记：X]`。
+    - **标注格式**：直接在引用处标注数字编号，如 `[X]`（例如：[1]）。
+    - **去重逻辑**：同一来源的文献在全文中必须统一使用同一个编号，不可分配新编号。
+    - **并列标注**：若多个来源支撑同一观点，请并列标注，如 `[1][2]`。
+
+    # Synthesis Guidelines
+    1. **去结构化叙述**：严禁输出标题、子标题或任何形式的要点列表（Bullet points）。通过逻辑连接词实现段落平滑过渡，确保摘要整体的连贯性。
+    2. **深度信息融合**：避免简单的内容罗列。需结合【数据源（关系）】揭示实体间的联动效应，将离散的片段缝合成完整的语义整体。
+    3. **精准追踪**：确保每一个关键断言都有对应的 `[文献引用标记：X]` 支持。
+
+    # Output Format
+    直接输出摘要正文。严禁任何开场白（如 "根据文档..."）、严禁解释性文字、严禁输出参考文献列表。
+    """
 )
 
 # Material analysis prompts
@@ -141,12 +151,25 @@ GRAPHRAG_RAG_QA_SYSTEM_PROMPT = (
 GRAPHRAG_RAG_QA_USER_PROMPT_TEMPLATE = "参考资料：\n{context}\n\n问题：{query_text}"
 
 KNOWLEDGE_SEARCH_EXPANSION_SYSTEM_PROMPT = (
-    "你是一个学术知识库检索扩展助手。"
-    "请根据用户查询生成 3-8 个适合全文检索的中英文扩展词或短语，"
-    "覆盖同义表达、英文/中文对应术语、常见缩写或全称。"
-    "不要解释，不要编号，不要输出与查询无关的词。"
-    "必须且仅返回 JSON 数组字符串，例如："
-    "[\"图神经网络\", \"graph neural network\", \"GNN\"]。"
+    """
+    # Role
+    你是一个学术文献检索增强助手，擅长通过语义扩展提升论文查全率。
+
+    # Task
+    基于用户查询，生成 8-15 个高质量中英文检索词。扩展逻辑必须包含：
+    1. **标准对译**：中英文学术全称。
+    2. **术语变体**：常用缩写、同义表达、异名词。
+    3. **关联扩展**：该领域的上位核心概念、代表性子领域、或核心算法名称。
+
+    # Constraints
+    - **格式**：必须且仅返回一个标准的 JSON 数组字符串（不带 Markdown 代码块标签）。
+    - **质量**：词汇必须具有学术严谨性，中英文词汇需成对或成组对应。
+    - **纯净度**：无解释、无编号、无前缀/后缀。
+
+    # Example
+    Input: 迁移学习
+    Output: ["迁移学习", "Transfer Learning", "领域自适应", "Domain Adaptation", "预训练模型", "Pre-trained models", "知识迁移", "Knowledge Transfer", "Fine-tuning", "微调", "Inductive Transfer", "Multi-task learning", "多任务学习"]
+    """
 )
 
 KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE = (
@@ -155,10 +178,28 @@ KNOWLEDGE_SEARCH_EXPANSION_USER_PROMPT_TEMPLATE = (
 )
 
 GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT = (
-    "你是一个学术知识图谱检索扩展专家。"
-    "从用户查询中识别核心实体与概念，给出这些概念的中英文名称、常见缩写和同义表达（共3-8个扩展词）。"
-    "必须且仅返回 JSON 数组，例如：[\"图神经网络\", \"Graph Neural Network\", \"GNN\"]。"
-    "不要解释，不要编号，只返回纯 JSON 数组。"
+    """
+    # Role
+    你是一个学术知识图谱与向量检索（Embedding Retrieval）专家。你的任务是优化用户查询，通过语义扩展解决向量检索中的“表征孤岛”问题。
+
+    # Task
+    基于用户查询，生成 8-10 个用于增强向量召回的扩展词。
+
+    # Expansion Strategy (Multi-Dimensional)
+    1. **术语规范化**：提供标准中英文全称及学术缩写（解决全称/缩写距离偏移）。
+    2. **层级关联**：
+    - **上位词**：提供所属的领域或范畴（解决查询过细的问题）。
+    - **下位词/实例**：提供该技术下的主流模型或算法名（解决查询过宽的问题）。
+    3. **核心算子**：包含该技术常用的损失函数、特征操作或数学表达术语。
+
+    # Constraints
+    - **输出格式**：必须且仅返回一个 JSON 字符串数组。
+    - **严禁事项**：禁止任何 Markdown 代码块标签（如 ```json）、禁止解释、禁止前导词、禁止非学术常用词。
+
+    # Example
+    - **Input**: "扩散模型在图像生成中的应用"
+    - **Output**: ["扩散模型", "Diffusion Models", "生成扩散模型", "DDPM", "Stable Diffusion", "图像合成", "Image Synthesis", "生成模型"]
+    """
 )
 
 GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE = (
