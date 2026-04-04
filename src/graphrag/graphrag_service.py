@@ -6,6 +6,8 @@ import re
 import json
 import sqlite3
 import hashlib
+import uuid
+from datetime import datetime, timezone
 import math
 
 try:
@@ -213,6 +215,13 @@ def _label_from_topic_uri(uri: str) -> str:
     else:
         slug = value.rsplit("/", 1)[-1]
     return re.sub(r"[_\-]+", " ", slug).strip()
+
+
+def _temp_scope_paper_id(session_scope: str) -> int:
+    """将会话作用域映射为稳定的负数 paper_id，避免与正式库正数 ID 冲突。"""
+    digest = hashlib.md5(session_scope.encode("utf-8")).hexdigest()
+    # 取前 12 位十六进制，范围足够且稳定。
+    return -(int(digest[:12], 16) + 1)
 
 
 def _parse_nt_uri_triple(line: str) -> Optional[tuple]:
@@ -2062,6 +2071,9 @@ class GraphRAGService:
             key_entities = row.get("key_entities") or []
             entities = row.get("entities") or []
             relations = row.get("relations") or []
+            session_scope = str(row.get("session_scope") or "").strip() or None
+            is_temp = bool(row.get("is_temp", False))
+            expires_at = row.get("expires_at")
 
             if paper_id is None or not chunk_id or not text:
                 continue
@@ -2107,6 +2119,9 @@ class GraphRAGService:
                     "key_entities": key_entities,
                     "entities": normalized_entities,
                     "relations": relations,
+                    "session_scope": session_scope,
+                    "is_temp": is_temp,
+                    "expires_at": expires_at,
                 }
             )
 
@@ -2136,6 +2151,9 @@ class GraphRAGService:
         MERGE (p:Paper {paper_id: row.paper_id})
         SET p.title = row.title,
             p.year = row.year,
+            p.session_scope = row.session_scope,
+            p.is_temp = row.is_temp,
+            p.expires_at = CASE WHEN row.expires_at IS NULL THEN null ELSE datetime(row.expires_at) END,
             p.updated_at = datetime()
 
         MERGE (c:Chunk {chunk_id: row.chunk_id})
@@ -2145,6 +2163,9 @@ class GraphRAGService:
             c.chunk_index = row.index,
             c.section_name = row.section_name,
             c.key_entities = row.key_entities,
+            c.session_scope = row.session_scope,
+            c.is_temp = row.is_temp,
+            c.expires_at = CASE WHEN row.expires_at IS NULL THEN null ELSE datetime(row.expires_at) END,
             c.updated_at = datetime()
 
         MERGE (p)-[:HAS_CHUNK]->(c)
@@ -2213,6 +2234,200 @@ class GraphRAGService:
         return {
             "upserted": count,
             "aligned_concepts": link_result.get("linked", 0),
+        }
+
+    def upsert_temp_ocr_content(
+        self,
+        title: str,
+        content: str,
+        session_scope: Optional[str] = None,
+        ttl_hours: int = 24,
+        chunk_size: int = 500,
+        chunk_overlap: int = 50,
+        auto_extract_entities: bool = True,
+    ) -> Dict[str, Any]:
+        """将 OCR 内容写入临时图谱作用域，仅用于当前会话检索。"""
+        self._ensure_embedding_ready()
+
+        normalized_title = (title or "OCR 临时文档").strip() or "OCR 临时文档"
+        normalized_content = (content or "").strip()
+        if not normalized_content:
+            raise ValueError("OCR 内容为空，无法写入图谱")
+
+        normalized_scope = (session_scope or "").strip() or f"ocr-{uuid.uuid4().hex[:12]}"
+        temp_doc_key = f"{normalized_scope}:{uuid.uuid4().hex[:8]}"
+        temp_paper_id = _temp_scope_paper_id(temp_doc_key)
+
+        ttl = int(ttl_hours) if ttl_hours is not None else 24
+        ttl = max(1, min(ttl, 24 * 7))
+
+        hierarchical_chunks = _hierarchical_semantic_chunking(
+            normalized_content,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+
+        rows: List[Dict[str, Any]] = []
+        for i, chunk_data in enumerate(hierarchical_chunks):
+            # _hierarchical_semantic_chunking 返回字段是 chunk_text/section_name/chunk_index
+            chunk_text = str(chunk_data.get("chunk_text") or chunk_data.get("text") or "").strip()
+            section_name = str(chunk_data.get("section_name") or chunk_data.get("section") or "Body").strip() or "Body"
+            chunk_index = chunk_data.get("chunk_index")
+            chunk_index = int(chunk_index) if chunk_index is not None else i
+            if not chunk_text:
+                continue
+            chunk_entities: List[Dict[str, str]] = []
+            chunk_relations: List[Dict[str, str]] = []
+
+            if auto_extract_entities:
+                extracted_triplets = _extract_triplets_from_text(chunk_text, self.settings.llm_model)
+                chunk_relations = extracted_triplets
+
+                entity_set = set()
+                for triplet in extracted_triplets:
+                    src = str(triplet.get("source") or "").strip()
+                    tgt = str(triplet.get("target") or "").strip()
+                    if src:
+                        entity_set.add(src)
+                    if tgt:
+                        entity_set.add(tgt)
+                chunk_entities = [{"name": name, "type": "Concept"} for name in entity_set]
+
+            rows.append(
+                {
+                    "paper_id": temp_paper_id,
+                    "title": normalized_title,
+                    "year": None,
+                    "chunk_id": f"temp_{normalized_scope}_{temp_doc_key[-8:]}_{i}",
+                    "text": chunk_text,
+                    "index": chunk_index,
+                    "section_name": section_name,
+                    "key_entities": [e.get("name") for e in chunk_entities if e.get("name")],
+                    "entities": chunk_entities,
+                    "relations": chunk_relations,
+                    "session_scope": normalized_scope,
+                    "is_temp": True,
+                    "expires_at": f"datetime() + duration('PT{ttl}H')",
+                }
+            )
+
+        if not rows:
+            raise ValueError("OCR 切片为空，未写入临时图谱")
+
+        # expires_at 使用 Neo4j 表达式不能直接作为参数 datetime() 计算，这里改为绝对时间戳字符串。
+        from datetime import timedelta
+        expires_iso = (datetime.now(timezone.utc) + timedelta(hours=ttl)).isoformat()
+        for row in rows:
+            row["expires_at"] = expires_iso
+
+        self.ensure_vector_index(force_recreate=False)
+        result = self.upsert_paper_chunks(rows)
+        return {
+            "session_scope": normalized_scope,
+            "temp_paper_id": temp_paper_id,
+            "chunks": len(rows),
+            "upserted": result.get("upserted", 0),
+            "aligned_concepts": result.get("aligned_concepts", 0),
+            "ttl_hours": ttl,
+        }
+
+    def cleanup_temp_scope(self, session_scope: str) -> Dict[str, Any]:
+        """删除指定临时会话作用域下的 OCR 图数据。"""
+        scope = (session_scope or "").strip()
+        if not scope:
+            raise ValueError("session_scope 不能为空")
+
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (c:Chunk)
+                WHERE c.is_temp = true AND c.session_scope = $scope
+                WITH collect(c) AS chunks, count(c) AS chunk_count
+                FOREACH (x IN chunks | DETACH DELETE x)
+                RETURN chunk_count
+                """,
+                {"scope": scope},
+            ).single()
+            deleted_chunks = int(record["chunk_count"] or 0) if record else 0
+
+            record = session.run(
+                """
+                MATCH (p:Paper)
+                WHERE p.is_temp = true AND p.session_scope = $scope
+                WITH collect(p) AS papers, count(p) AS paper_count
+                FOREACH (x IN papers | DETACH DELETE x)
+                RETURN paper_count
+                """,
+                {"scope": scope},
+            ).single()
+            deleted_papers = int(record["paper_count"] or 0) if record else 0
+
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE NOT (e)<-[:MENTIONS]-(:Chunk) AND NOT (:Paper)-[:HAS_ENTITY]->(e)
+                WITH collect(e) AS entities, count(e) AS entity_count
+                FOREACH (x IN entities | DETACH DELETE x)
+                RETURN entity_count
+                """
+            ).single()
+            deleted_orphan_entities = int(record["entity_count"] or 0) if record else 0
+
+        return {
+            "session_scope": scope,
+            "deleted_chunks": deleted_chunks,
+            "deleted_papers": deleted_papers,
+            "deleted_orphan_entities": deleted_orphan_entities,
+        }
+
+    def cleanup_expired_temp_data(self) -> Dict[str, Any]:
+        """清理已过期临时 OCR 图数据。"""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (c:Chunk)
+                WHERE c.is_temp = true
+                  AND c.expires_at IS NOT NULL
+                  AND datetime(c.expires_at) <= datetime($now_iso)
+                WITH collect(c) AS chunks, count(c) AS chunk_count
+                FOREACH (x IN chunks | DETACH DELETE x)
+                RETURN chunk_count
+                """,
+                {"now_iso": now_iso},
+            ).single()
+            deleted_chunks = int(record["chunk_count"] or 0) if record else 0
+
+            record = session.run(
+                """
+                MATCH (p:Paper)
+                WHERE p.is_temp = true
+                  AND p.expires_at IS NOT NULL
+                  AND datetime(p.expires_at) <= datetime($now_iso)
+                WITH collect(p) AS papers, count(p) AS paper_count
+                FOREACH (x IN papers | DETACH DELETE x)
+                RETURN paper_count
+                """,
+                {"now_iso": now_iso},
+            ).single()
+            deleted_papers = int(record["paper_count"] or 0) if record else 0
+
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE NOT (e)<-[:MENTIONS]-(:Chunk) AND NOT (:Paper)-[:HAS_ENTITY]->(e)
+                WITH collect(e) AS entities, count(e) AS entity_count
+                FOREACH (x IN entities | DETACH DELETE x)
+                RETURN entity_count
+                """
+            ).single()
+            deleted_orphan_entities = int(record["entity_count"] or 0) if record else 0
+
+        return {
+            "now": now_iso,
+            "deleted_chunks": deleted_chunks,
+            "deleted_papers": deleted_papers,
+            "deleted_orphan_entities": deleted_orphan_entities,
         }
 
     def sync_from_mysql_knowledge_base(
@@ -2467,7 +2682,10 @@ class GraphRAGService:
         YIELD node, score
         OPTIONAL MATCH (p:Paper)-[:HAS_CHUNK]->(node)
                 WITH node, score, p
-                WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
+            WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
+              AND ($session_scope IS NULL OR p.session_scope = $session_scope)
+              AND (p.is_temp IS NULL OR p.is_temp = false OR p.session_scope = $session_scope)
+              AND (p.is_temp IS NULL OR p.is_temp = false OR p.expires_at IS NULL OR p.expires_at > datetime())
         RETURN
           node.chunk_id AS chunk_id,
           node.text AS text,
@@ -2475,13 +2693,18 @@ class GraphRAGService:
           score,
           p.paper_id AS paper_id,
           p.title AS title,
-          p.year AS year
+                    p.year AS year,
+                    p.session_scope AS session_scope,
+                    p.is_temp AS is_temp
         ORDER BY score DESC
         """
 
         keyword_query = """
         MATCH (p:Paper)-[:HAS_CHUNK]->(c:Chunk)
         WHERE ($paper_ids IS NULL OR p.paper_id IN $paper_ids)
+                    AND ($session_scope IS NULL OR p.session_scope = $session_scope)
+                    AND (p.is_temp IS NULL OR p.is_temp = false OR p.session_scope = $session_scope)
+                    AND (p.is_temp IS NULL OR p.is_temp = false OR p.expires_at IS NULL OR p.expires_at > datetime())
           AND (
             size($keywords) = 0
             OR any(k IN $keywords WHERE toLower(coalesce(c.text, "")) CONTAINS k OR toLower(coalesce(p.title, "")) CONTAINS k)
@@ -2501,7 +2724,9 @@ class GraphRAGService:
           lexical_score AS score,
           p.paper_id AS paper_id,
           p.title AS title,
-          p.year AS year
+                    p.year AS year,
+                    p.session_scope AS session_scope,
+                    p.is_temp AS is_temp
         ORDER BY lexical_score DESC, p.year DESC
         LIMIT $limit
         """
@@ -2530,6 +2755,19 @@ class GraphRAGService:
             ordered.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
             return ordered
 
+        def _rank_rows(rows: List[Dict[str, Any]], scope: Optional[str]) -> List[Dict[str, Any]]:
+            if not scope:
+                rows.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+                return rows
+            rows.sort(
+                key=lambda x: (
+                    1 if x.get("session_scope") == scope else 0,
+                    float(x.get("score") or 0.0),
+                ),
+                reverse=True,
+            )
+            return rows
+
         keywords = _normalize_keywords(expanded_query)
         search_mode = "vector"
         all_rows: List[Dict[str, Any]] = []
@@ -2539,6 +2777,10 @@ class GraphRAGService:
         vector_fetch_k = min(effective_top_k * 2, 50)
         expanded_fetch_k = min(effective_top_k * 3, 100)
         normalized_paper_ids = [int(x) for x in (paper_ids or []) if x is not None] or None
+        normalized_scope = (session_scope or "").strip() or None
+        scoped_paper_ids = normalized_paper_ids
+
+        allow_relaxed_fallback = bool(normalized_paper_ids) and not normalized_scope and not include_global
 
         with self.driver.session() as session:
             # 第一阶段：向量检索（保留用户给定 paper_ids 过滤）
@@ -2549,7 +2791,8 @@ class GraphRAGService:
                         "index_name": self.settings.vector_index_name,
                         "top_k": vector_fetch_k,
                         "embedding": query_embedding,
-                        "paper_ids": normalized_paper_ids,
+                        "paper_ids": scoped_paper_ids,
+                        "session_scope": normalized_scope,
                     },
                 )
             )
@@ -2570,12 +2813,30 @@ class GraphRAGService:
                             "top_k": expanded_fetch_k,
                             "embedding": query_embedding,
                             "paper_ids": None,
+                            "session_scope": None,
                         },
                     )
                 )
                 if relaxed_vector_rows:
                     search_mode = "vector_relaxed_paper_filter"
                     all_rows.extend(relaxed_vector_rows)
+
+            if include_global and normalized_scope:
+                global_rows = list(
+                    session.run(
+                        vector_query,
+                        {
+                            "index_name": self.settings.vector_index_name,
+                            "top_k": expanded_fetch_k,
+                            "embedding": query_embedding,
+                            "paper_ids": None,
+                            "session_scope": None,
+                        },
+                    )
+                )
+                if global_rows:
+                    search_mode = "vector_scope_plus_global"
+                    all_rows.extend(global_rows)
 
             merged_rows = _dedupe_rows(all_rows)
 
@@ -2585,7 +2846,8 @@ class GraphRAGService:
                     session.run(
                         keyword_query,
                         {
-                            "paper_ids": normalized_paper_ids,
+                            "paper_ids": scoped_paper_ids,
+                            "session_scope": normalized_scope,
                             "keywords": keywords,
                             "limit": expanded_fetch_k,
                         },
@@ -2605,6 +2867,7 @@ class GraphRAGService:
                         keyword_query,
                         {
                             "paper_ids": None,
+                            "session_scope": None,
                             "keywords": keywords,
                             "limit": expanded_fetch_k,
                         },
@@ -2636,6 +2899,8 @@ class GraphRAGService:
                 "paper_id": r["paper_id"],
                 "title": r["title"],
                 "year": r["year"],
+                "session_scope": r.get("session_scope"),
+                "is_temp": r.get("is_temp"),
             }
             for r in rows
         ]
@@ -2643,7 +2908,9 @@ class GraphRAGService:
             "query_text": query_text,
             "expanded_query": expanded_query,
             "top_k": top_k,
-            "paper_ids": normalized_paper_ids,
+            "paper_ids": scoped_paper_ids,
+            "session_scope": normalized_scope,
+            "include_global": include_global,
             "search_mode": search_mode,
             "results": response,
         }
@@ -2653,12 +2920,20 @@ class GraphRAGService:
         query_text: str,
         top_k: int = 5,
         paper_ids: Optional[List[int]] = None,
+        session_scope: Optional[str] = None,
+        include_global: bool = False,
     ) -> Dict[str, Any]:
         """检索相关 chunks 后调用本地 LLM 生成回答。"""
         self._ensure_ai_ready()
 
         # 1) 向量检索获取上下文
-        search_result = self.similarity_search(query_text, top_k=top_k, paper_ids=paper_ids)
+        search_result = self.similarity_search(
+            query_text,
+            top_k=top_k,
+            paper_ids=paper_ids,
+            session_scope=session_scope,
+            include_global=include_global,
+        )
         chunks = search_result.get("results", [])
         if not chunks:
             return {

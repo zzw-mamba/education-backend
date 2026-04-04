@@ -87,6 +87,8 @@ class TemplateSummaryRequest(BaseModel):
     """基于模板 + GraphRAG 生成摘要请求模型。"""
     query_text: str = Field(..., description="用户关注主题/问题")
     paper_ids: Optional[List[int]] = Field(default=None, description="可选：限定论文 ID 范围")
+    session_scope: Optional[str] = Field(default=None, description="临时 OCR 会话作用域")
+    include_global: bool = Field(default=False, description="是否联合检索全库")
     top_k: int = Field(default=8, ge=1, le=30, description="向量召回数量")
     focus_direction: str = Field(default="行业发展趋势与技术演进路径", description="摘要聚焦方向")
     style: str = Field(default="客观严谨的学术/商业报告风格", description="文风要求")

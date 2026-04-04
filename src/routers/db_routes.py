@@ -110,6 +110,50 @@ def _normalize_search_term(term: str) -> str:
     return re.sub(r"\s+", " ", term).strip().strip('"')
 
 
+# 中英双向同义词兜底：避免仅靠 LLM 扩展导致某一语言检索召回不足
+_BILINGUAL_SYNONYM_MAP = {
+    "人工智能": ["artificial intelligence", "ai"],
+    "ai": ["人工智能", "机器智能"],
+    "机器学习": ["machine learning", "ml"],
+    "深度学习": ["deep learning"],
+    "神经网络": ["neural network", "neural networks"],
+    "自然语言处理": ["natural language processing", "nlp"],
+    "计算机视觉": ["computer vision"],
+    "注意力机制": ["attention mechanism", "attention"],
+    "自注意力": ["self-attention", "self attention"],
+    "transformer": ["Transformer模型", "注意力机制"],
+    "attention": ["注意力机制", "自注意力"],
+}
+
+
+def _expand_terms_with_bilingual_synonyms(terms: set[str]) -> set[str]:
+    expanded = set(terms)
+
+    for term in list(terms):
+        normalized = _normalize_search_term(term)
+        lower_term = normalized.lower()
+
+        # 精准命中词典键
+        if normalized in _BILINGUAL_SYNONYM_MAP:
+            expanded.update(_BILINGUAL_SYNONYM_MAP[normalized])
+        if lower_term in _BILINGUAL_SYNONYM_MAP:
+            expanded.update(_BILINGUAL_SYNONYM_MAP[lower_term])
+
+        # 子串命中（例如“人工智能技术”包含“人工智能”）
+        for key, alias_list in _BILINGUAL_SYNONYM_MAP.items():
+            key_norm = key.lower()
+            if key in normalized or key_norm in lower_term:
+                expanded.update(alias_list)
+
+    # 全量再归一化一遍，去除空值与重复
+    normalized_terms = set()
+    for item in expanded:
+        normalized_item = _normalize_search_term(str(item))
+        if normalized_item:
+            normalized_terms.add(normalized_item)
+    return normalized_terms
+
+
 def _expand_search_terms_with_llm(query: str) -> List[str]:
     normalized_query = query.strip()
     if not normalized_query:
@@ -146,7 +190,8 @@ def _expand_search_terms_with_llm(query: str) -> List[str]:
     except (LLMError, json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    return list(terms)[:8]
+    terms = _expand_terms_with_bilingual_synonyms(terms)
+    return list(terms)[:16]
 
 def rerank_documents_with_llm(query: str, docs: List[dict], top_k: int = 5) -> List[dict]:
     """兜底降级方案：使用现有大语言模型进行相关性重排。"""

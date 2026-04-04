@@ -30,6 +30,45 @@ os.makedirs(ANALYSIS_OUTPUT_DIR, exist_ok=True)
 MAX_CHUNK_LENGTH = 8000  # 每个块的最大字符数
 CHUNK_OVERLAP = 500      # 块之间的重叠字符数
 
+
+def parse_first_json_payload(text: str):
+    """从任意文本中提取并解析首个 JSON 对象/数组。"""
+    if text is None:
+        raise ValueError("LLM 返回为空")
+
+    content = str(text).strip()
+    if not content:
+        raise ValueError("LLM 返回为空字符串")
+
+    # 优先处理 markdown code fence
+    if "```json" in content:
+        content = content.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in content:
+        content = content.split("```", 1)[1].split("```", 1)[0].strip()
+
+    decoder = json.JSONDecoder()
+
+    # 先尝试整段直接解析
+    try:
+        return json.loads(content)
+    except Exception:
+        pass
+
+    # 再从首个 { 或 [ 开始做 raw_decode，容忍前后噪声文本
+    first_obj = content.find("{")
+    first_arr = content.find("[")
+    starts = [i for i in (first_obj, first_arr) if i != -1]
+    if not starts:
+        raise ValueError(f"未找到 JSON 起始符，原始返回前200字符: {content[:200]}")
+
+    start = min(starts)
+    sub = content[start:]
+    try:
+        parsed, _ = decoder.raw_decode(sub)
+        return parsed
+    except Exception as exc:
+        raise ValueError(f"无法解析 JSON，原始返回前200字符: {content[:200]}") from exc
+
 def chunk_text(text, max_length=MAX_CHUNK_LENGTH, overlap=CHUNK_OVERLAP):
     """
     将长文本分割成多个重叠的块
@@ -164,13 +203,8 @@ def process_material_workflow(material_item):
                 try:
                     analysis_result = call_llm_api(MATERIAL_PARSING_PROMPT, f"待分析内容如下 (第{i+1}/{len(chunks)}部分): " + chunk)
                     content_str = analysis_result['choices'][0]['message']['content']
-                    
-                    if "```json" in content_str:
-                        content_str = content_str.split("```json")[1].split("```")[0].strip()
-                    elif "```" in content_str:
-                        content_str = content_str.split("```")[1].strip()
-                    
-                    chunk_data = json.loads(content_str)
+
+                    chunk_data = parse_first_json_payload(content_str)
                     chunk_results.append(chunk_data)
                 except Exception as e:
                     print(f"  块 {i+1} 处理失败: {e}")
@@ -182,13 +216,8 @@ def process_material_workflow(material_item):
             result['chunks_processed'] = 1
             analysis_result = call_llm_api(MATERIAL_PARSING_PROMPT, "待分析内容如下: " + content)
             content_str = analysis_result['choices'][0]['message']['content']
-            
-            if "```json" in content_str:
-                content_str = content_str.split("```json")[1].split("```")[0].strip()
-            elif "```" in content_str:
-                content_str = content_str.split("```")[1].strip()
-            
-            result['data'] = json.loads(content_str)
+
+            result['data'] = parse_first_json_payload(content_str)
 
     except Exception as e:
         result['status'] = "failed"
