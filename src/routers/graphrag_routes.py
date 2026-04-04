@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -7,6 +8,11 @@ from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERRO
 
 
 router = APIRouter(prefix="/api/graphrag", tags=["graphrag"])
+
+
+DEFAULT_SYNC_LIMIT = int(os.getenv("GRAPHRAG_SYNC_LIMIT", "100"))
+DEFAULT_SYNC_CHUNK_SIZE = int(os.getenv("GRAPHRAG_SYNC_CHUNK_SIZE", "800"))
+DEFAULT_SYNC_CHUNK_OVERLAP = int(os.getenv("GRAPHRAG_SYNC_CHUNK_OVERLAP", "120"))
 
 
 class EntityInput(BaseModel):
@@ -41,9 +47,9 @@ class CreateIndexRequest(BaseModel):
 
 class SyncFromMySQLRequest(BaseModel):
     paper_ids: Optional[List[int]] = None
-    limit: int = Field(default=100, ge=1, le=20000)
-    chunk_size: int = Field(default=800, ge=100, le=4000)
-    chunk_overlap: int = Field(default=120, ge=0, le=1000)
+    limit: int = Field(default=DEFAULT_SYNC_LIMIT, ge=1, le=20000)
+    chunk_size: int = Field(default=DEFAULT_SYNC_CHUNK_SIZE, ge=100, le=4000)
+    chunk_overlap: int = Field(default=DEFAULT_SYNC_CHUNK_OVERLAP, ge=0, le=1000)
     auto_extract_entities: bool = Field(default=True, description="是否自动抽取实体并构建 MENTIONS 关系")
 
 
@@ -53,19 +59,22 @@ class SetupLocalDBRequest(BaseModel):
     ontology_file_path: str = Field(default="src/CSO.3.5.nt", description="本体 N-Triples 文件路径")
     sync_from_mysql: bool = False
     paper_ids: Optional[List[int]] = None
-    limit: int = Field(default=100, ge=1, le=20000)
-    chunk_size: int = Field(default=800, ge=100, le=4000)
-    chunk_overlap: int = Field(default=120, ge=0, le=1000)
+    limit: int = Field(default=DEFAULT_SYNC_LIMIT, ge=1, le=20000)
+    chunk_size: int = Field(default=DEFAULT_SYNC_CHUNK_SIZE, ge=100, le=4000)
+    chunk_overlap: int = Field(default=DEFAULT_SYNC_CHUNK_OVERLAP, ge=0, le=1000)
     auto_extract_entities: bool = Field(default=True, description="同步时是否自动抽取实体")
 
 
 class PaperSummaryRequest(BaseModel):
     paper_id: int
+    paper_ids: Optional[List[int]] = Field(default=None, description="摘要范围论文 ID 列表；为空时使用 paper_id")
+    query_text: Optional[str] = Field(default=None, description="若提供则启用 query+concept 扩展摘要链路")
     top_entities: int = Field(default=10, ge=1, le=30)
     snippets_per_entity: int = Field(default=2, ge=1, le=5)
     neighbor_limit: int = Field(default=5, ge=0, le=20)
     recursive_group_size: int = Field(default=4, ge=1, le=10)
     section_aware: bool = Field(default=True, description="是否启用章节感知摘要")
+    concept_max_hops: int = Field(default=2, ge=1, le=2, description="Concept 拓展最大跳数，建议 1-2")
 
 
 def _service_or_500():
@@ -343,6 +352,18 @@ async def paper_summary(request: PaperSummaryRequest):
     """
     service = _service_or_500()
     try:
+        if request.query_text and request.query_text.strip():
+            target_paper_ids = request.paper_ids or [request.paper_id]
+            result = service.generate_query_concept_summary(
+                query_text=request.query_text.strip(),
+                paper_ids=target_paper_ids,
+                anchor_entity_limit=request.top_entities,
+                concept_max_hops=request.concept_max_hops,
+                direct_snippets_per_paper=request.snippets_per_entity * 3,
+                expanded_snippets_per_paper=request.snippets_per_entity * 3,
+            )
+            return {"success": True, **result}
+
         result = service.generate_paper_summary(
             paper_id=request.paper_id,
             top_entities=request.top_entities,

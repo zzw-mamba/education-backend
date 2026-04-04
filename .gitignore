@@ -6,7 +6,7 @@
 /temp_uploads
 /uploaded_files
 /bibs
-/ocr_output
+/ocr_outputs/
 .env
 .idea/
 database/

@@ -22,6 +22,14 @@ class GraphRAGSettings:
     local_embedding_base_url: str
     local_embedding_api_path: str
     local_embedding_timeout: float
+    sync_limit: int
+    sync_chunk_size: int
+    sync_chunk_overlap: int
+    semantic_chunk_min_len_abs: int
+    semantic_chunk_min_len_ratio: float
+    semantic_drop_quantile: float
+    semantic_low_sim_quantile: float
+    semantic_fallback_low_sim_quantile: float
 
     @classmethod
     def from_env(cls) -> "GraphRAGSettings":
@@ -40,6 +48,14 @@ class GraphRAGSettings:
             local_embedding_base_url=os.getenv("LOCAL_EMBEDDING_BASE_URL", "http://localhost:9091"),
             local_embedding_api_path=os.getenv("LOCAL_EMBEDDING_API_PATH", "/v1/embeddings"),
             local_embedding_timeout=float(os.getenv("LOCAL_EMBEDDING_TIMEOUT", "30")),
+            sync_limit=int(os.getenv("GRAPHRAG_SYNC_LIMIT", "100")),
+            sync_chunk_size=int(os.getenv("GRAPHRAG_SYNC_CHUNK_SIZE", "800")),
+            sync_chunk_overlap=int(os.getenv("GRAPHRAG_SYNC_CHUNK_OVERLAP", "120")),
+            semantic_chunk_min_len_abs=int(os.getenv("GRAPHRAG_SEMANTIC_CHUNK_MIN_LEN_ABS", "120")),
+            semantic_chunk_min_len_ratio=float(os.getenv("GRAPHRAG_SEMANTIC_CHUNK_MIN_LEN_RATIO", "0.35")),
+            semantic_drop_quantile=float(os.getenv("GRAPHRAG_SEMANTIC_DROP_QUANTILE", "0.90")),
+            semantic_low_sim_quantile=float(os.getenv("GRAPHRAG_SEMANTIC_LOW_SIM_QUANTILE", "0.20")),
+            semantic_fallback_low_sim_quantile=float(os.getenv("GRAPHRAG_SEMANTIC_FALLBACK_LOW_SIM_QUANTILE", "0.10")),
         )
 
     def validate(self) -> None:
