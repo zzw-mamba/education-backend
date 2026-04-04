@@ -17,7 +17,9 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # 密码哈希配置
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# 当前环境里 bcrypt 5.x 与 passlib 1.7.4 存在兼容性问题，主方案改用 argon2；
+# 同时保留旧 bcrypt / bcrypt_sha256 哈希的验证能力。
+pwd_context = CryptContext(schemes=["argon2", "bcrypt_sha256", "bcrypt"], deprecated="auto")
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)

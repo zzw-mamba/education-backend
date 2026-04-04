@@ -194,17 +194,29 @@ def _expand_search_terms_with_llm(query: str) -> List[str]:
     return list(terms)[:16]
 
 def rerank_documents_with_llm(query: str, docs: List[dict], top_k: int = 5) -> List[dict]:
-    """兜底降级方案：使用已有大语言模型作为 Reranker (LLM-as-a-Judge)"""
-    print(f"[Reranker - Fallback] 正在使用现有大模型(LLM)对 {len(docs)} 个文本进行深度语义重排...")
+    """兜底降级方案：使用现有大语言模型进行相关性重排。"""
+    print(f"[LLM Re-rank] 正在使用现有大模型对 {len(docs)} 个文本进行相关性重排...")
     
-    system_prompt = """你是一个智能的搜索相关性重排专家。
-对于用户的查询（Query），你需要评估后续提供的几个文档片段（Doc）与查询的相关性。
-请给每个文档打分，分数范围在 0 到 100 之间。
-相关：直接回答了问题或包含关键信息，打 80-100 分。
-部分相关：有关联但没有直接回答，打 40-79 分。
-不相关：字面一样但语义反转，或者是无关内容，打 0-39 分。
-请你强制输出合法的 JSON 字典，键为文档ID（如 "doc_0"，"doc_1"），值为整数分数。不要输出任何除了 JSON 之外的其他分析或废话。
-示例格式：{"doc_0": 85, "doc_1": 10, "doc_2": 95}"""
+    system_prompt = """
+    # Role
+    你是一位精通自然语义理解的搜索相关性专家（Rerank Expert）。你的任务是严谨评估文档（Doc）与用户查询（Query）之间的语义匹配程度。
+
+    # Task
+    根据用户提供的 Query 和一系列 Doc，依下列【评分准则】为每个文档打分。
+
+    # Scoring Rubric (0-100)
+    - **80-100（高相关）**: 文档完美回答了 Query，包含核心答案或高度匹配的关键信息。
+    - **40-79（部分相关）**: 文档主题相关，但仅触及边缘信息，未直接回答核心问题，或存在信息缺失。
+    - **0-39（不相关）**: 文档内容偏离主题、存在语义反转（如否定词）、或是毫无关联的干扰信息。
+
+    # Constraints
+    1. **语义优先**：关注意图匹配而非单纯的关键词重叠。
+    2. **严苛评估**：若文档只是字面相似但逻辑相悖，必须判定为不相关（0-39）。
+    3. **输出格式**：禁止输出任何推理过程、解释或开场白。必须严格输出标准的 JSON 字典格式。
+
+    # Output Format
+    {"doc_n": score, ...}
+    """
 
     docs_text = []
     for i, d in enumerate(docs):
@@ -219,7 +231,7 @@ def rerank_documents_with_llm(query: str, docs: List[dict], top_k: int = 5) -> L
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=600,
+            max_tokens=32768,
             temperature=0.1,
         )
         
@@ -242,63 +254,20 @@ def rerank_documents_with_llm(query: str, docs: List[dict], top_k: int = 5) -> L
                 d["score"] = d["rerank_score"]
             return reranked_docs[:top_k]
         else:
-            print("[Reranker - Fallback] 大模型未返回合法 JSON。")
+            print("[LLM Re-rank] 大模型未返回合法 JSON。")
 
     except Exception as e:
-        print(f"[Reranker - Fallback] LLM 联合打分失败: {e}")
+        print(f"[LLM Re-rank] LLM 联合打分失败: {e}")
         
-    print("[Reranker] 所有重排手段均失败，执行最终降级回退(返回原始排序)。")
+    print("[LLM Re-rank] 所有重排手段均失败，执行最终降级回退(返回原始排序)。")
     return docs[:top_k]
 
 
 def rerank_documents(query: str, docs: List[dict], top_k: int = 5) -> List[dict]:
-    # ================= 优化 5：rerank重排 =================
-    """主引流入口：优先尝试专属 Reranker API，如果失败则走 LLM 降级"""
+    """直接使用大语言模型对候选文档进行相关性重排。"""
     if not docs:
         return docs
-        
-    api_key = os.getenv("RERANKER_API_KEY", "").strip('\"\'') 
-    api_base = os.getenv("RERANKER_API_BASE", "https://api.siliconflow.cn/v1/rerank").strip('\"\'')
-    model = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3").strip('\"\'')
 
-    if api_key and api_key != "your_siliconflow_api_key_here":
-        try:
-            print(f"[Reranker] 尝试请求专属重排模型API进行首选打分 ({model})...")
-            import requests
-            texts = [str(d["content"])[:512].replace('\n', ' ') for d in docs]
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": model,
-                "query": query,
-                "documents": texts
-            }
-            
-            resp = requests.post(api_base, json=payload, headers=headers, timeout=12)
-            if resp.status_code == 200:
-                data = resp.json()
-                results = data.get("results", [])
-                results.sort(key=lambda x: x["index"])
-                
-                for i, r in enumerate(results):
-                    docs[i]["rerank_score"] = float(r["relevance_score"])
-                    
-                reranked_docs = sorted(docs, key=lambda x: x.get("rerank_score", 0), reverse=True)
-                for d in reranked_docs:
-                    # 保留两位小数给前端
-                    d["score"] = round(d["rerank_score"], 4) 
-                print("[Reranker] 专属API重排成功！")
-                return reranked_docs[:top_k]
-            else:
-                print(f"[Reranker] 专属API返回错误: HTTP {resp.status_code} - {resp.text}，准备降级。")
-        except Exception as e:
-            print(f"[Reranker] 专属API调用异常: {e}，准备降级。")
-    else:
-        print("[Reranker] 专属API未配置或者为空，跳过API重排。")
-        
-    # 如果API失败，或者上面的逻辑没有return掉，则进入大模型打分
     return rerank_documents_with_llm(query, docs, top_k)
 
 # --- 1. 测试连接 (保留并增强) ---
@@ -369,40 +338,35 @@ def search_knowledge_robust(q: str, db: Session = Depends(get_db)):
     search_payload = " ".join([f'"{term}"' for term in search_terms])
     print(f"Expanded search terms: {search_terms}, payload: {search_payload}")
 
-    # 第 1 步：粗筛（高召回），为避免 MySQL 引擎对 MATCH 浮点数进行加权运算时出现 DOUBLE out of range 越界 Bug，
-    # 我们将单独获取两部分的分数，然后再在 Python 代码层进行归一化及加权运算和重新排序。
+    # 第 1 步：粗筛（高召回），多拿一些数据（20条），不管是不是字面上刚好撞车的
     sql = text("""
         SELECT id, title, authors, year, content,
-            MATCH(title) AGAINST(:payload IN BOOLEAN MODE) AS title_score,
-            MATCH(content) AGAINST(:payload IN BOOLEAN MODE) AS content_score
+            (
+                (MATCH(title) AGAINST(:payload IN BOOLEAN MODE) * 5) + 
+                (MATCH(content) AGAINST(:payload IN BOOLEAN MODE) * 1)
+            ) AS score
         FROM knowledge_base
         WHERE MATCH(title, content) AGAINST(:payload IN BOOLEAN MODE)
-        ORDER BY MATCH(title, content) AGAINST(:payload IN BOOLEAN MODE) DESC
-        LIMIT 40
+        ORDER BY score DESC
+        LIMIT 20
     """)
 
     result = db.execute(sql, {"payload": search_payload}).all()
 
-    # 将查询结果转成字典列表并在此处计算实际加权分数，随后进行重新排序选出前 20 条
-    docs_to_rerank = []
-    for r in result:
-        # Title score 的权重为 5，content score 的权重为 1
-        weighted_score = (r.title_score * 5.0) + (r.content_score * 1.0)
-        docs_to_rerank.append({
+    # 将查询结果转成字典列表以便后续 LLM 重排处理
+    docs_to_rerank = [
+        {
             "id": r.id, 
             "title": r.title, 
-            "score": round(weighted_score, 4),
+            "score": round(r.score, 2),
             "authors": r.authors,
             "year": r.year,
             "content": r.content
-        })
-    
-    # 根据归一化加权后的分数进行降序排序，取前 20 条喂给后续的精排模型
-    docs_to_rerank.sort(key=lambda x: x["score"], reverse=True)
-    docs_to_rerank = docs_to_rerank[:20]
+        } for r in result
+    ]
 
     # 第 2 步：精排（高精度），用轻量级 LLM/重排模型剔除“字面相似语义相反”的内容，挑选 Top 5
-    final_docs = rerank_documents(query=q, docs=docs_to_rerank, top_k=5)
+    final_docs = rerank_documents(query=q, docs=docs_to_rerank, top_k=10)
 
     # 返回精选后的内容并裁剪预览
     for doc in final_docs:

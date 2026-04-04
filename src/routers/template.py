@@ -1,5 +1,6 @@
 import ast
 import html
+import json
 import threading
 from pathlib import Path
 from typing import List, Optional, Union
@@ -96,6 +97,8 @@ class TemplateSummaryRequest(BaseModel):
     snippets_per_entity: int = Field(default=2, ge=1, le=5, description="每个实体保留的上下文片段数")
     neighbor_limit: int = Field(default=4, ge=0, le=20, description="图谱实体邻居数量")
     max_graph_papers: int = Field(default=3, ge=1, le=10, description="最多补充图谱上下文的论文数")
+    use_concept_expansion: bool = Field(default=True, description="是否启用 Query+CSO 概念扩展摘要链路")
+    concept_max_hops: int = Field(default=2, ge=1, le=2, description="Concept 拓展最大跳数，建议 1-2")
 
 
 def _update_summary_job(job_id: str, **fields) -> None:
@@ -151,8 +154,7 @@ def _execute_summary_generation(
         request.query_text,
         top_k=request.top_k,
         paper_ids=request.paper_ids,
-        session_scope=request.session_scope,
-        include_global=request.include_global,
+        strict_paper_filter=True,
     )
     chunks = search_result.get("results", [])
     if not chunks:
@@ -178,7 +180,7 @@ def _execute_summary_generation(
 
     citations, paper_citation_ids = _build_citation_mapping(chunks)
     document_chunks = _format_document_chunks(chunks, paper_citation_ids)
-    graph_relations = _format_graph_context(graphrag_service, request, chunks)
+    graph_relations, concept_context_meta = _format_graph_context(graphrag_service, request, chunks)
     if not graph_relations.strip():
         graph_relations = "暂无可用图谱上下文。"
 
@@ -225,6 +227,12 @@ def _execute_summary_generation(
 
     result_id = str(uuid4())
     export_info = _export_summary_bundle(summary_markdown, result_id)
+    export_info["provenance_json_path"] = _export_provenance_debug_json(
+        result_id=result_id,
+        query_text=request.query_text,
+        chunks=chunks,
+        paper_citation_ids=paper_citation_ids,
+    )
 
     graph_block_count = graph_relations.count("【实体】")
     knowledge_ids = _build_knowledge_ids_for_log(search_result, chunks)
@@ -250,6 +258,8 @@ def _execute_summary_generation(
             "summary_markdown": summary_markdown,
             "retrieved_chunks": len(chunks),
             "graph_context_blocks": graph_block_count,
+            "concept_expanded_topics": concept_context_meta.get("expanded_topics", []),
+            "concept_anchor_entities": concept_context_meta.get("anchor_entities", []),
             "paper_ids": search_result.get("paper_ids"),
             "citations": citations,
             "log_id": log_entry.id,
@@ -387,31 +397,115 @@ def _build_citation_mapping(chunks: List[dict]) -> tuple[dict, dict]:
     return citations, paper_citation_ids
 
 
-def _format_graph_context(service, request: TemplateSummaryRequest, chunks: List[dict]) -> str:
-    """基于召回论文补充图谱实体上下文，增强跨片段关系理解。"""
+def _format_graph_context(service, request: TemplateSummaryRequest, chunks: List[dict]) -> tuple[str, dict]:
+    """基于召回论文补充图谱上下文；优先接入 query+concept 扩展链路。"""
     paper_ids: List[int] = []
     for chunk in chunks:
         paper_id = chunk.get("paper_id")
         if isinstance(paper_id, int) and paper_id not in paper_ids:
             paper_ids.append(paper_id)
 
+    target_paper_ids = request.paper_ids or paper_ids[: request.max_graph_papers]
+    concept_context_meta: dict = {
+        "expanded_topics": [],
+        "anchor_entities": [],
+    }
+
     graph_context_parts: List[str] = []
-    for paper_id in paper_ids[: request.max_graph_papers]:
+
+    if request.use_concept_expansion and request.query_text.strip() and target_paper_ids:
         try:
-            refined = service.get_graph_refined_context(
-                paper_id=paper_id,
-                top_entities=request.graph_top_entities,
-                snippets_per_entity=request.snippets_per_entity,
-                neighbor_limit=request.neighbor_limit,
+            concept_result = service.generate_query_concept_summary(
+                query_text=request.query_text,
+                paper_ids=target_paper_ids,
+                anchor_entity_limit=request.graph_top_entities,
+                concept_max_hops=request.concept_max_hops,
+                direct_snippets_per_paper=request.snippets_per_entity * 3,
+                expanded_snippets_per_paper=request.snippets_per_entity * 3,
             )
+            concept_context_meta["expanded_topics"] = concept_result.get("expanded_topics", [])
+            concept_context_meta["anchor_entities"] = [
+                {
+                    "name": item.get("name"),
+                    "type": item.get("type"),
+                    "score": item.get("score"),
+                }
+                for item in concept_result.get("anchor_entities", [])
+            ]
+
+            expanded_topics = concept_result.get("expanded_topics", [])
+            if expanded_topics:
+                graph_context_parts.append("[Concept 扩展主题]\n" + "、".join(expanded_topics))
+
+            papers = concept_result.get("papers", [])
+            for paper in papers:
+                direct_chunks = paper.get("direct_chunks", [])
+                expanded_chunks = paper.get("expanded_chunks", [])
+                direct_preview = "\n".join([f"- {c[:220]}" for c in direct_chunks[:4]]) or "- 无"
+                expanded_preview = "\n".join([f"- {c[:220]}" for c in expanded_chunks[:4]]) or "- 无"
+                graph_context_parts.append(
+                    "\n".join(
+                        [
+                            f"[Paper {paper.get('paper_id')}] {paper.get('title') or '未知标题'}",
+                            f"直接主题: {', '.join(paper.get('direct_topics') or []) or '无'}",
+                            f"扩展主题: {', '.join(paper.get('expanded_topics') or []) or '无'}",
+                            "直接证据:",
+                            direct_preview,
+                            "关联延伸证据:",
+                            expanded_preview,
+                        ]
+                    )
+                )
+
+            concept_summary = (concept_result.get("summary") or "").strip()
+            if concept_summary:
+                graph_context_parts.append("[Concept 融合综述草案]\n" + concept_summary)
         except Exception:
-            continue
+            # 概念链路异常时，自动回退到原图谱上下文逻辑。
+            pass
 
-        blocks = refined.get("context_blocks", [])
-        if blocks:
-            graph_context_parts.append(f"[Paper {paper_id}]\n" + "\n\n".join(blocks))
+    if not graph_context_parts:
+        for paper_id in paper_ids[: request.max_graph_papers]:
+            try:
+                refined = service.get_graph_refined_context(
+                    paper_id=paper_id,
+                    top_entities=request.graph_top_entities,
+                    snippets_per_entity=request.snippets_per_entity,
+                    neighbor_limit=request.neighbor_limit,
+                )
+            except Exception:
+                continue
 
-    return "\n\n".join(graph_context_parts)
+            blocks = refined.get("context_blocks", [])
+            if blocks:
+                graph_context_parts.append(f"[Paper {paper_id}]\n" + "\n\n".join(blocks))
+
+    return "\n\n".join(graph_context_parts), concept_context_meta
+
+
+def _build_provenance_debug_records(chunks: List[dict], paper_citation_ids: dict) -> List[dict]:
+    """构建溯源调试记录，保留片段内容和文献名。"""
+    records: List[dict] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        paper_id = chunk.get("paper_id")
+        title = (chunk.get("title") or "未知").strip() or "未知"
+        paper_key = f"paper:{paper_id}" if paper_id is not None else f"title:{title}"
+        score = chunk.get("score")
+
+        records.append(
+            {
+                "rank": idx,
+                "citation_id": paper_citation_ids.get(paper_key),
+                "paper_id": paper_id,
+                "paper_title": title,
+                "chunk_id": chunk.get("chunk_id"),
+                "chunk_index": chunk.get("chunk_index"),
+                "score": float(score) if score is not None else None,
+                "snippet_text": chunk.get("text") or "",
+            }
+        )
+
+    return records
 
 
 def _build_knowledge_ids_for_log(search_result: dict, chunks: List[dict]) -> str:
@@ -574,6 +668,29 @@ def _export_summary_bundle(markdown_text: str, result_id: str) -> dict:
         "word_path": _to_server_relative(docx_path),
         "pdf_path": _to_server_relative(pdf_path),
     }
+
+
+def _export_provenance_debug_json(
+    result_id: str,
+    query_text: str,
+    chunks: List[dict],
+    paper_citation_ids: dict,
+) -> str:
+    """导出溯源调试 JSON 文件。"""
+    export_dir = _ensure_summary_export_dir()
+    json_path = export_dir / f"{result_id}_provenance.json"
+
+    payload = {
+        "result_id": result_id,
+        "query_text": query_text,
+        "records": _build_provenance_debug_records(chunks, paper_citation_ids),
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    try:
+        return json_path.relative_to(SERVER_ROOT_DIR).as_posix()
+    except ValueError:
+        return json_path.name
 
 @router.post("/template/build", response_model=TemplateResponse)
 def build_template(request: str):
