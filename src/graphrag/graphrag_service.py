@@ -6,6 +6,7 @@ import re
 import json
 import sqlite3
 import hashlib
+import math
 
 try:
     from tqdm import tqdm
@@ -23,6 +24,11 @@ from prompt import (
     GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT,
     GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE,
 )
+
+try:
+    from langchain_text_splitters import MarkdownHeaderTextSplitter
+except Exception:
+    MarkdownHeaderTextSplitter = None
 
 try:
     from neo4j_graphrag.indexes import create_vector_index
@@ -180,7 +186,7 @@ def _normalize_section_name(raw_title: str) -> str:
         return "Experiments"
     if "conclusion" in title or "总结" in title or "结论" in title:
         return "Conclusion"
-    return raw_title.strip() if raw_title.strip() else "Body"
+    return "Body"
 
 
 def _normalize_concept_term(raw: str) -> str:
@@ -217,38 +223,155 @@ def _parse_nt_uri_triple(line: str) -> Optional[tuple]:
     return match.group(1), match.group(2), match.group(3)
 
 
-def _split_by_markdown_sections(text: str) -> List[Dict[str, str]]:
-    """按 Markdown 标题切分正文，返回带章节名的内容段。"""
-    source = (text or "").strip()
+def _normalize_heading_text(raw_heading: str) -> str:
+    """清洗标题文本中的编号前缀。"""
+    heading = (raw_heading or "").strip()
+    heading = re.sub(r"^(?:[IVXLCM]+|\d+)\s*[\.)：:、\-]?\s+", "", heading, flags=re.IGNORECASE)
+    heading = re.sub(r"^第[一二三四五六七八九十百千\d]+[章节部分]\s*", "", heading)
+    return heading.strip() or "Body"
+
+
+def _extract_section_heading(line: str) -> Optional[str]:
+    """识别 Markdown 标题和常见论文纯文本标题（如 I. INTRODUCTION）。"""
+    text = (line or "").strip()
+    if not text:
+        return None
+
+    md_match = re.match(r"^#{1,6}\s+(.+?)\s*$", text)
+    if md_match:
+        return _normalize_heading_text(md_match.group(1))
+
+    numbered_match = re.match(r"^(?:[IVXLCM]+|\d+)\s*[\.)：:、\-]?\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+    if numbered_match:
+        candidate = numbered_match.group(1).strip()
+        if candidate and len(candidate) <= 120:
+            return _normalize_heading_text(candidate)
+
+    zh_title_match = re.match(r"^第[一二三四五六七八九十百千\d]+[章节部分]\s*(.+?)\s*$", text)
+    if zh_title_match:
+        return _normalize_heading_text(zh_title_match.group(1))
+
+    bare_title_match = re.match(
+        r"^(introduction|background|related work|method|methodology|approach|experiments?|evaluation|results?|discussion|conclusion|references?|bibliography|摘要|引言|结论|参考文献)\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if bare_title_match:
+        return _normalize_heading_text(text)
+
+    # 无法确定是否为标题，返回 None，让它作为 Body 内容处理
+    return None
+
+
+def _split_reference_block(source: str) -> tuple[str, str]:
+    """切分 references 区域，返回 (正文, references)。"""
+    pattern = re.compile(
+        r"(?im)^\s*(?:#{1,6}\s*)?(references|bibliography|参考文献)\s*$"
+    )
+    match = pattern.search(source)
+    if not match:
+        return source, ""
+    return source[:match.start()].strip(), source[match.start():].strip()
+
+
+def _split_header_and_body(source: str) -> tuple[str, str]:
+    """按 Introduction 或首个结构化标题切分头部与正文。"""
+    intro_pattern = re.compile(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:[IVXLCM]+|\d+)?\s*[\.)：:、\-]?\s*(introduction|引言|前言)\b"
+    )
+    intro_match = intro_pattern.search(source)
+    if intro_match:
+        return source[:intro_match.start()].strip(), source[intro_match.start():].strip()
+
+    offset = 0
+    for line in source.splitlines(keepends=True):
+        heading = _extract_section_heading(line.strip())
+        if heading and heading.lower() not in {"abstract", "摘要"}:
+            return source[:offset].strip(), source[offset:].strip()
+        offset += len(line)
+
+    return source.strip(), ""
+
+
+def _split_metadata_and_abstract(header_area: str) -> tuple[str, str]:
+    """在头部区域识别 metadata 与 abstract。"""
+    if not header_area:
+        return "", ""
+
+    abs_pattern = re.compile(
+        r"(?ims)^\s*(?:#{1,6}\s*)?(abstract|摘要)\b\s*[:：\-—]?\s*"
+    )
+    abs_match = abs_pattern.search(header_area)
+    if not abs_match:
+        return header_area.strip(), ""
+
+    metadata = header_area[:abs_match.start()].strip()
+    abstract = header_area[abs_match.start():].strip()
+    return metadata, abstract
+
+
+def _split_body_into_sections(body_text: str) -> List[Dict[str, str]]:
+    """按结构化标题切分正文。"""
+    source = (body_text or "").strip()
     if not source:
         return []
 
-    lines = source.splitlines()
     sections: List[Dict[str, str]] = []
     current_title = "Body"
     buffer: List[str] = []
 
-    header_pattern = re.compile(r"^\s{0,3}#{1,3}\s+(.+?)\s*$")
-    for line in lines:
-        match = header_pattern.match(line)
-        if match:
+    for line in source.splitlines():
+        heading = _extract_section_heading(line)
+        if heading:
             content = "\n".join(buffer).strip()
             if content:
-                sections.append({
-                    "section_name": _normalize_section_name(current_title),
-                    "content": content,
-                })
-            current_title = match.group(1)
+                sections.append(
+                    {
+                        "section_name": _normalize_section_name(current_title),
+                        "content": content,
+                    }
+                )
+            current_title = heading
             buffer = []
-        else:
-            buffer.append(line)
+            continue
+        buffer.append(line)
 
     tail = "\n".join(buffer).strip()
     if tail:
-        sections.append({
-            "section_name": _normalize_section_name(current_title),
-            "content": tail,
-        })
+        sections.append(
+            {
+                "section_name": _normalize_section_name(current_title),
+                "content": tail,
+            }
+        )
+
+    return sections
+
+
+def _split_by_markdown_sections(text: str) -> List[Dict[str, str]]:
+    """按论文结构流式切分：metadata/abstract/body/references。"""
+    source = (text or "").strip()
+    if not source:
+        return []
+
+    content_without_refs, references_text = _split_reference_block(source)
+    header_area, body_area = _split_header_and_body(content_without_refs)
+    metadata_text, abstract_text = _split_metadata_and_abstract(header_area)
+
+    sections: List[Dict[str, str]] = []
+    if metadata_text:
+        sections.append({"section_name": "Metadata", "content": metadata_text})
+    if abstract_text:
+        sections.append({"section_name": "Abstract", "content": abstract_text})
+
+    body_sections = _split_body_into_sections(body_area)
+    if body_sections:
+        sections.extend(body_sections)
+    elif body_area:
+        sections.append({"section_name": "Body", "content": body_area})
+
+    if references_text:
+        sections.append({"section_name": "References", "content": references_text})
 
     if not sections:
         return [{"section_name": "Body", "content": source}]
@@ -256,8 +379,13 @@ def _split_by_markdown_sections(text: str) -> List[Dict[str, str]]:
     return sections
 
 
-def _semantic_window_chunks(text: str, chunk_size: int = 600, chunk_overlap: int = 90) -> List[str]:
-    """按语义句窗切片，保留相邻块的可控重叠。"""
+def _semantic_window_chunks(
+    text: str,
+    chunk_size: int = 600,
+    chunk_overlap: int = 90,
+    embedder: Optional[LocalEmbeddings] = None,
+) -> List[str]:
+    """先按段落切分；仅对超长段落做基于 embedding 跳变的语义切分。"""
     source = (text or "").strip()
     if not source:
         return []
@@ -270,39 +398,208 @@ def _semantic_window_chunks(text: str, chunk_size: int = 600, chunk_overlap: int
     if chunk_overlap >= chunk_size:
         chunk_overlap = max(0, int(chunk_size * 0.15))
 
-    sentence_parts = [s.strip() for s in re.split(r"(?<=[。！？!?\.])\s+|\n+", source) if s.strip()]
-    if not sentence_parts:
-        sentence_parts = [source]
+    semantic_min_len_abs = int(os.getenv("GRAPHRAG_SEMANTIC_CHUNK_MIN_LEN_ABS", "120"))
+    semantic_min_len_ratio = float(os.getenv("GRAPHRAG_SEMANTIC_CHUNK_MIN_LEN_RATIO", "0.35"))
+    semantic_drop_quantile = float(os.getenv("GRAPHRAG_SEMANTIC_DROP_QUANTILE", "0.90"))
+    semantic_low_sim_quantile = float(os.getenv("GRAPHRAG_SEMANTIC_LOW_SIM_QUANTILE", "0.20"))
+    semantic_fallback_low_sim_quantile = float(os.getenv("GRAPHRAG_SEMANTIC_FALLBACK_LOW_SIM_QUANTILE", "0.10"))
 
-    chunks: List[str] = []
-    current: List[str] = []
-    current_len = 0
+    local_embedder = embedder
+    if local_embedder is None:
+        settings = get_graphrag_settings()
+        if settings.local_embedding_base_url.strip():
+            local_embedder = LocalEmbeddings(
+                base_url=settings.local_embedding_base_url,
+                api_path=settings.local_embedding_api_path,
+                model=settings.embedding_model,
+                timeout=settings.local_embedding_timeout,
+            )
 
-    for sentence in sentence_parts:
-        sentence_len = len(sentence)
-        if current and current_len + sentence_len > chunk_size:
+    def _quantile(values: List[float], q: float) -> float:
+        if not values:
+            return 0.0
+        q = min(1.0, max(0.0, float(q)))
+        sorted_vals = sorted(values)
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        pos = q * (len(sorted_vals) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return sorted_vals[lo]
+        frac = pos - lo
+        return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+    def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
+        if not v1 or not v2 or len(v1) != len(v2):
+            return 0.0
+        dot = sum(a * b for a, b in zip(v1, v2))
+        n1 = math.sqrt(sum(a * a for a in v1))
+        n2 = math.sqrt(sum(b * b for b in v2))
+        if n1 <= 1e-12 or n2 <= 1e-12:
+            return 0.0
+        return dot / (n1 * n2)
+
+    def _split_sentences(text_block: str) -> List[str]:
+        sentences = [s.strip() for s in re.split(r"(?<=[。！？!?\.])\s+|\n+", text_block) if s.strip()]
+        return sentences or [text_block.strip()]
+
+    def _semantic_cut_indices(sentences: List[str]) -> set:
+        if local_embedder is None or len(sentences) < 3:
+            return set()
+        try:
+            vectors = local_embedder.embed_documents(sentences)
+        except Exception:
+            return set()
+
+        if len(vectors) != len(sentences):
+            return set()
+
+        sims: List[float] = []
+        for i in range(len(vectors) - 1):
+            sims.append(_cosine_similarity(vectors[i], vectors[i + 1]))
+
+        if len(sims) < 2:
+            return set()
+
+        drops: List[float] = []
+        drop_pos: List[int] = []
+        for i in range(1, len(sims)):
+            drops.append(sims[i - 1] - sims[i])
+            drop_pos.append(i + 1)
+
+        drop_threshold = _quantile(drops, semantic_drop_quantile)
+        sim_low_threshold = _quantile(sims, semantic_low_sim_quantile)
+
+        cut_indices = {
+            pos
+            for pos, drop_score in zip(drop_pos, drops)
+            if drop_score >= drop_threshold and sims[pos - 1] <= sim_low_threshold
+        }
+
+        # 若未检测到突变点，则退化为“低相似度切分”，避免超长同质块。
+        if not cut_indices:
+            low_sim_threshold = _quantile(sims, semantic_fallback_low_sim_quantile)
+            cut_indices = {i + 1 for i, sim in enumerate(sims) if sim <= low_sim_threshold}
+
+        return cut_indices
+
+    def _pack_sentences_with_semantic_breaks(sentences: List[str]) -> List[str]:
+        if not sentences:
+            return []
+
+        cut_indices = _semantic_cut_indices(sentences)
+        min_chunk_len = max(semantic_min_len_abs, int(chunk_size * semantic_min_len_ratio))
+
+        chunks: List[str] = []
+        current: List[str] = []
+        current_len = 0
+
+        for i, sentence in enumerate(sentences):
+            sentence_len = len(sentence)
+
+            if current and (current_len + sentence_len > chunk_size):
+                chunks.append(" ".join(current).strip())
+
+                overlap_keeper: List[str] = []
+                overlap_len = 0
+                for prev in reversed(current):
+                    prev_len = len(prev)
+                    if overlap_len + prev_len <= chunk_overlap:
+                        overlap_keeper.insert(0, prev)
+                        overlap_len += prev_len
+                    else:
+                        break
+
+                current = overlap_keeper.copy()
+                current_len = sum(len(x) for x in current)
+
+            current.append(sentence)
+            current_len += sentence_len
+
+            next_index = i + 1
+            if current and next_index in cut_indices and current_len >= min_chunk_len:
+                chunks.append(" ".join(current).strip())
+                current = []
+                current_len = 0
+
+        if current:
             chunks.append(" ".join(current).strip())
 
-            overlap_keeper: List[str] = []
-            overlap_len = 0
-            for prev in reversed(current):
-                prev_len = len(prev)
-                if overlap_len + prev_len <= chunk_overlap:
-                    overlap_keeper.insert(0, prev)
-                    overlap_len += prev_len
-                else:
-                    break
+        return [c for c in chunks if c]
 
-            current = overlap_keeper.copy()
-            current_len = sum(len(x) for x in current)
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", source) if p.strip()]
+    if not paragraphs:
+        paragraphs = [source]
 
-        current.append(sentence)
-        current_len += sentence_len
+    final_chunks: List[str] = []
+    for para in paragraphs:
+        if len(para) <= chunk_size:
+            final_chunks.append(para)
+            continue
 
-    if current:
-        chunks.append(" ".join(current).strip())
+        para_sentences = _split_sentences(para)
+        final_chunks.extend(_pack_sentences_with_semantic_breaks(para_sentences))
 
-    return [c for c in chunks if c]
+    return [c for c in final_chunks if c]
+
+
+def _split_by_markdown_headers(text: str) -> List[str]:
+    """在单个章节内部继续按 Markdown 标题切分。"""
+    source = (text or "").strip()
+    if not source:
+        return []
+
+    if MarkdownHeaderTextSplitter is None:
+        return [source]
+
+    headers_to_split_on = [
+        ("#", "h1"),
+        ("##", "h2"),
+        ("###", "h3"),
+        ("####", "h4"),
+        ("#####", "h5"),
+        ("######", "h6"),
+    ]
+
+    splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=True)
+    docs = splitter.split_text(source)
+    blocks = [doc.page_content.strip() for doc in docs if getattr(doc, "page_content", "").strip()]
+    return blocks or [source]
+
+
+def _sanitize_llm_json_content(raw_content: str) -> str:
+    """清理 LLM 输出中的思考内容与包装文本，尽量提取可解析 JSON。"""
+    content = (raw_content or "").strip()
+    if not content:
+        return ""
+
+    # 去除常见思考标签。
+    content = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
+
+    # 优先提取 markdown fenced code block 内的内容。
+    fenced_match = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*([\s\S]*?)\s*```", content)
+    if fenced_match:
+        content = fenced_match.group(1).strip()
+
+    # 兜底去除首尾 code fence。
+    content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+
+    # 尝试截取首个 JSON 对象或数组，容忍前后解释性文本。
+    obj_start, obj_end = content.find("{"), content.rfind("}")
+    arr_start, arr_end = content.find("["), content.rfind("]")
+
+    candidates = []
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        candidates.append((obj_start, obj_end + 1))
+    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+        candidates.append((arr_start, arr_end + 1))
+
+    if candidates:
+        start, end = min(candidates, key=lambda x: x[0])
+        content = content[start:end].strip()
+
+    return content
 
 
 def _optimize_chunk_params_by_language(text: str, default_size: int = 600, default_overlap: int = 90) -> tuple:
@@ -328,7 +625,12 @@ def _optimize_chunk_params_by_language(text: str, default_size: int = 600, defau
         return 500, 80   # 中文使用高密度紧凑切分
 
 
-def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_overlap: int = 90) -> List[Dict[str, str]]:
+def _hierarchical_semantic_chunking(
+    text: str,
+    chunk_size: int = 600,
+    chunk_overlap: int = 90,
+    embedder: Optional[LocalEmbeddings] = None,
+) -> List[Dict[str, str]]:
     """先按章节再按语义窗口切片，输出带章节与全局序号的切片。"""
     
     # ================= 优化 2：语言自适应计算最佳切片结界 =================
@@ -362,17 +664,25 @@ def _hierarchical_semantic_chunking(text: str, chunk_size: int = 600, chunk_over
             continue
 
         content = section["content"]
-        sub_chunks = _semantic_window_chunks(content, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        markdown_blocks = _split_by_markdown_headers(content)
 
-        for i, chunk_text in enumerate(sub_chunks):
-            output.append(
-                {
-                    "section_name": section_name,
-                    "chunk_text": chunk_text,
-                    "chunk_index": global_index,
-                }
+        for block in markdown_blocks:
+            sub_chunks = _semantic_window_chunks(
+                block,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                embedder=embedder,
             )
-            global_index += 1
+
+            for chunk_text in sub_chunks:
+                output.append(
+                    {
+                        "section_name": section_name,
+                        "chunk_text": chunk_text,
+                        "chunk_index": global_index,
+                    }
+                )
+                global_index += 1
 
     return output
 
@@ -420,9 +730,7 @@ def _extract_triplets_from_text(text: str, llm_model: Optional[str] = None) -> L
                 }
             ]
         )
-        content = response.content.strip()
-        # 清理可能存在的 markdown code block
-        content = re.sub(r"^```[a-zA-Z]*\n|```$", "", content, flags=re.MULTILINE).strip()
+        content = _sanitize_llm_json_content(response.content)
         
         if content.startswith('['):
             triplets = json.loads(content)
@@ -465,8 +773,7 @@ def _dynamic_entity_mapping(entities: list, llm_model: Optional[str] = None) -> 
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}]
         )
-        content = response.content.strip()
-        content = re.sub(r"^```[a-zA-Z]*\n|```$", "", content, flags=re.MULTILINE).strip()
+        content = _sanitize_llm_json_content(response.content)
         
         mapping = json.loads(content)
         return mapping
@@ -666,8 +973,7 @@ class GraphRAGService:
                     },
                 ],
             )
-            content = response.content.strip()
-            content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+            content = _sanitize_llm_json_content(response.content)
             parsed = json.loads(content)
             english_term = str(parsed.get("english_term") or "").strip()
             return english_term or source
@@ -784,8 +1090,7 @@ class GraphRAGService:
                 max_tokens=120,
                 messages=[{"role": "user", "content": prompt}],
             )
-            content = response.content.strip()
-            content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+            content = _sanitize_llm_json_content(response.content)
             obj = json.loads(content)
             selected = obj.get("selected_normalized_name")
             if selected is None:
@@ -841,11 +1146,299 @@ class GraphRAGService:
         )
         return response.content.strip()
 
+    def _summarize_query_concept_context_with_llm(
+        self,
+        query_text: str,
+        expanded_topics: List[str],
+        paper_blocks: List[Dict[str, Any]],
+    ) -> str:
+        """基于 query 与 concept 拓展上下文生成跨论文摘要。"""
+        self._ensure_summary_ready()
+
+        topic_line = "、".join([t for t in expanded_topics if t])[:1200] or "无"
+        sections: List[str] = []
+        for item in paper_blocks:
+            direct_chunks = item.get("direct_chunks", []) or []
+            expanded_chunks = item.get("expanded_chunks", []) or []
+            direct_preview = "\n".join([f"- {c[:240]}" for c in direct_chunks[:4]]) or "- 无"
+            expanded_preview = "\n".join([f"- {c[:240]}" for c in expanded_chunks[:4]]) or "- 无"
+            sections.append(
+                "\n".join(
+                    [
+                        f"### 论文: {item.get('title') or '未知标题'} (paper_id={item.get('paper_id')})",
+                        f"- 直接主题: {', '.join(item.get('direct_topics') or []) or '无'}",
+                        f"- 扩展主题: {', '.join(item.get('expanded_topics') or []) or '无'}",
+                        "- 直接证据:",
+                        direct_preview,
+                        "- 关联延伸证据:",
+                        expanded_preview,
+                    ]
+                )
+            )
+
+        context_body = "\n\n".join(sections)
+        system_prompt = (
+            "你是一个学术综述助手。你会利用 query 对齐实体、concept 本体扩展和跨论文证据，"
+            "生成结构化、可溯源的中文摘要。"
+        )
+        user_prompt = (
+            f"Theme: {query_text}\n"
+            f"Ontology Context: 已基于以下概念扩展: {topic_line}\n\n"
+            f"Evidence by Paper:\n{context_body}\n\n"
+            "Instruction:\n"
+            "请输出 250-450 字中文摘要，必须包含：\n"
+            "1) 研究主题与范围；\n"
+            "2) 各论文在同一概念下的共性；\n"
+            "3) 方法或结论差异；\n"
+            "4) 至少 2 条基于关联延伸证据的跨术语对齐观察。"
+        )
+
+        response = ask_messages(
+            model=self.settings.llm_model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return response.content.strip()
+
+    def get_query_concept_refined_context(
+        self,
+        query_text: str,
+        paper_ids: List[int],
+        anchor_entity_limit: int = 10,
+        concept_max_hops: int = 2,
+        direct_snippets_per_paper: int = 6,
+        expanded_snippets_per_paper: int = 6,
+    ) -> Dict[str, Any]:
+        """Query -> Entity -> Concept 多跳扩展 -> 回推 Chunk 的摘要上下文构建。"""
+        self._ensure_embedding_ready()
+
+        normalized_paper_ids = sorted({int(x) for x in (paper_ids or [])})
+        if not normalized_paper_ids:
+            return {
+                "query_text": query_text,
+                "expanded_query": query_text,
+                "paper_ids": [],
+                "anchor_entities": [],
+                "expanded_topics": [],
+                "papers": [],
+            }
+
+        max_hops = max(1, min(int(concept_max_hops), 2))
+        expanded_query = self._expand_query_with_entities(query_text)
+        query_embedding = self._embed_text(expanded_query)
+
+        anchor_query = """
+        CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
+        YIELD node, score
+        MATCH (p:Paper)-[:HAS_CHUNK]->(node)-[:MENTIONS]->(e:Entity)
+        WHERE p.paper_id IN $paper_ids
+        WITH e, max(score) AS score, collect(DISTINCT p.paper_id) AS hit_papers
+        RETURN e.name AS name, e.type AS type, score, hit_papers
+        ORDER BY score DESC
+        LIMIT $anchor_entity_limit
+        """
+
+        keywords = [
+            t
+            for t in re.findall(r"[A-Za-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", expanded_query.lower())
+            if t
+        ][:12]
+
+        keyword_anchor_query = """
+        MATCH (p:Paper)-[:HAS_ENTITY]->(e:Entity)
+        WHERE p.paper_id IN $paper_ids
+          AND (
+            size($keywords) = 0
+            OR any(k IN $keywords WHERE toLower(coalesce(e.name, "")) CONTAINS k)
+          )
+        WITH e, count(DISTINCT p) AS paper_hits, collect(DISTINCT p.paper_id) AS hit_papers
+        RETURN e.name AS name, e.type AS type, toFloat(paper_hits) AS score, hit_papers
+        ORDER BY score DESC
+        LIMIT $anchor_entity_limit
+        """
+
+        concept_expand_query = f"""
+        MATCH (e:Entity {{name: $name, type: $type}})-[:ALIGNED_TO_CONCEPT]->(c1:Concept)
+        OPTIONAL MATCH (c1)-[:SUPER_TOPIC_OF|RELATED_EQUIVALENT*1..{max_hops}]-(c2:Concept)
+        RETURN
+          collect(DISTINCT c1.normalized_name) AS direct_topics,
+          collect(DISTINCT c2.normalized_name) AS expanded_topics
+        """
+
+        paper_direct_query = """
+        MATCH (p:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(e:Entity)
+        WHERE any(a IN $anchors WHERE a.name = e.name AND a.type = e.type)
+        RETURN p.title AS title,
+               collect(DISTINCT c.text)[0..$limit] AS chunks
+        """
+
+        paper_expanded_query = """
+        MATCH (p:Paper {paper_id: $paper_id})-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(e:Entity)-[:ALIGNED_TO_CONCEPT]->(cx:Concept)
+        WHERE cx.normalized_name IN $expanded_topics
+        RETURN collect(DISTINCT c.text)[0..$limit] AS chunks
+        """
+
+        anchor_entities: List[Dict[str, Any]] = []
+        with self.driver.session() as session:
+            rows = list(
+                session.run(
+                    anchor_query,
+                    {
+                        "index_name": self.settings.vector_index_name,
+                        "top_k": max(20, int(anchor_entity_limit) * 4),
+                        "embedding": query_embedding,
+                        "paper_ids": normalized_paper_ids,
+                        "anchor_entity_limit": int(anchor_entity_limit),
+                    },
+                )
+            )
+            if not rows:
+                rows = list(
+                    session.run(
+                        keyword_anchor_query,
+                        {
+                            "paper_ids": normalized_paper_ids,
+                            "keywords": keywords,
+                            "anchor_entity_limit": int(anchor_entity_limit),
+                        },
+                    )
+                )
+
+            for row in rows:
+                name = str(row.get("name") or "").strip()
+                etype = str(row.get("type") or "Unknown").strip() or "Unknown"
+                if not name:
+                    continue
+                anchor_entities.append(
+                    {
+                        "name": name,
+                        "type": etype,
+                        "score": float(row.get("score") or 0.0),
+                        "hit_papers": row.get("hit_papers") or [],
+                    }
+                )
+
+            # 去重并裁剪
+            dedup: Dict[str, Dict[str, Any]] = {}
+            for e in anchor_entities:
+                dedup[f"{e['name']}||{e['type']}"] = e
+            anchor_entities = list(dedup.values())[: int(anchor_entity_limit)]
+
+            global_direct_topics: set = set()
+            global_expanded_topics: set = set()
+            for e in anchor_entities:
+                topic_row = session.run(
+                    concept_expand_query,
+                    {"name": e["name"], "type": e["type"]},
+                ).single()
+                direct_topics = [t for t in (topic_row.get("direct_topics") if topic_row else []) if t]
+                expanded_topics = [t for t in (topic_row.get("expanded_topics") if topic_row else []) if t]
+                e["direct_topics"] = direct_topics
+                e["expanded_topics"] = expanded_topics
+                global_direct_topics.update(direct_topics)
+                global_expanded_topics.update(expanded_topics)
+
+            papers_payload: List[Dict[str, Any]] = []
+            for pid in normalized_paper_ids:
+                direct_row = session.run(
+                    paper_direct_query,
+                    {
+                        "paper_id": int(pid),
+                        "anchors": [{"name": x["name"], "type": x["type"]} for x in anchor_entities],
+                        "limit": int(direct_snippets_per_paper),
+                    },
+                ).single()
+                title = str(direct_row.get("title") or "") if direct_row else ""
+                direct_chunks = (direct_row.get("chunks") if direct_row else []) or []
+
+                expanded_row = session.run(
+                    paper_expanded_query,
+                    {
+                        "paper_id": int(pid),
+                        "expanded_topics": list(global_expanded_topics),
+                        "limit": int(expanded_snippets_per_paper),
+                    },
+                ).single()
+                expanded_chunks = (expanded_row.get("chunks") if expanded_row else []) or []
+
+                # 论文级主题取其直接证据中的实体主题并集
+                paper_topics = set()
+                for e in anchor_entities:
+                    if int(pid) in [int(x) for x in (e.get("hit_papers") or [])]:
+                        paper_topics.update(e.get("direct_topics") or [])
+
+                papers_payload.append(
+                    {
+                        "paper_id": int(pid),
+                        "title": title,
+                        "direct_topics": sorted(paper_topics),
+                        "expanded_topics": sorted(global_expanded_topics),
+                        "direct_chunks": [c for c in direct_chunks if c],
+                        "expanded_chunks": [c for c in expanded_chunks if c],
+                    }
+                )
+
+        return {
+            "query_text": query_text,
+            "expanded_query": expanded_query,
+            "paper_ids": normalized_paper_ids,
+            "anchor_entities": anchor_entities,
+            "direct_topics": sorted(global_direct_topics),
+            "expanded_topics": sorted(global_expanded_topics),
+            "papers": papers_payload,
+        }
+
+    def generate_query_concept_summary(
+        self,
+        query_text: str,
+        paper_ids: List[int],
+        anchor_entity_limit: int = 10,
+        concept_max_hops: int = 2,
+        direct_snippets_per_paper: int = 6,
+        expanded_snippets_per_paper: int = 6,
+    ) -> Dict[str, Any]:
+        """基于 query + concept 本体扩展的跨论文摘要。"""
+        context = self.get_query_concept_refined_context(
+            query_text=query_text,
+            paper_ids=paper_ids,
+            anchor_entity_limit=anchor_entity_limit,
+            concept_max_hops=concept_max_hops,
+            direct_snippets_per_paper=direct_snippets_per_paper,
+            expanded_snippets_per_paper=expanded_snippets_per_paper,
+        )
+
+        papers = context.get("papers", [])
+        if not papers:
+            return {
+                "query_text": query_text,
+                "paper_ids": paper_ids,
+                "summary": "未找到可用于概念扩展摘要的上下文，请检查 paper_ids 是否已完成图谱同步。",
+                "summary_method": "query_concept_none",
+                **context,
+            }
+
+        summary = self._summarize_query_concept_context_with_llm(
+            query_text=query_text,
+            expanded_topics=context.get("expanded_topics", []),
+            paper_blocks=papers,
+        )
+
+        return {
+            "query_text": query_text,
+            "paper_ids": paper_ids,
+            "summary": summary,
+            "summary_method": "query_concept_ontology",
+            **context,
+        }
+
     def get_graph_refined_context(
         self,
         paper_id: int,
-        top_entities: int = 10,
-        snippets_per_entity: int = 2,
+        top_entities: int = 25,
+        snippets_per_entity: int = 5,
         neighbor_limit: int = 5,
         section_filter: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
@@ -946,7 +1539,7 @@ class GraphRAGService:
         snippets_per_entity: int = 2,
         neighbor_limit: int = 5,
         recursive_group_size: int = 4,
-        section_aware: bool = True,
+        section_aware: bool = False,
     ) -> Dict[str, Any]:
         """
         生成论文摘要，支持章节感知的递归聚合。
@@ -1465,7 +2058,7 @@ class GraphRAGService:
             chunk_id = str(row.get("chunk_id") or "").strip()
             text = str(row.get("text") or "").strip()
             index = row.get("index")
-            section_name = str(row.get("section_name") or "Body")
+            section_name = _normalize_section_name(str(row.get("section_name") or "Body"))
             key_entities = row.get("key_entities") or []
             entities = row.get("entities") or []
             relations = row.get("relations") or []
@@ -1625,9 +2218,9 @@ class GraphRAGService:
     def sync_from_mysql_knowledge_base(
         self,
         paper_ids: Optional[List[int]] = None,
-        limit: int = 100,
-        chunk_size: int = 800,
-        chunk_overlap: int = 120,
+        limit: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
         auto_extract_entities: bool = True,
     ) -> Dict[str, Any]:
         """
@@ -1637,6 +2230,9 @@ class GraphRAGService:
             auto_extract_entities: 是否自动从切片中提取关键实体（需要 LLM 服务）
         """
         self._ensure_embedding_ready()
+        limit = int(self.settings.sync_limit if limit is None else limit)
+        chunk_size = int(self.settings.sync_chunk_size if chunk_size is None else chunk_size)
+        chunk_overlap = int(self.settings.sync_chunk_overlap if chunk_overlap is None else chunk_overlap)
         db = SessionLocal()
         try:
             query = db.query(KnowledgeBase)
@@ -1684,6 +2280,7 @@ class GraphRAGService:
                     content,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
+                    embedder=self.embedder,
                 )
                 if not hierarchical_chunks:
                     return {"paper_id": paper_id, "chunks": 0, "upserted": 0, "aligned_concepts": 0}
@@ -1773,9 +2370,9 @@ class GraphRAGService:
     def chunk_and_store_from_mysql(
         self,
         paper_ids: Optional[List[int]] = None,
-        limit: int = 100,
-        chunk_size: int = 800,
-        chunk_overlap: int = 120,
+        limit: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
         auto_extract_entities: bool = True,
     ) -> Dict[str, Any]:
         """同步接口别名：分块后写入 Neo4j。"""
@@ -1798,7 +2395,7 @@ class GraphRAGService:
             title = chunk.get("title", "Adhoc Paper")
             year = chunk.get("year")
             index = chunk.get("index", i)
-            section_name = chunk.get("section_name", "Body")
+            section_name = _normalize_section_name(str(chunk.get("section_name") or "Body"))
             key_entities = chunk.get("key_entities") or []
             entities = chunk.get("entities") or []
             if chunk_id and text:
@@ -1827,7 +2424,7 @@ class GraphRAGService:
             response = ask_messages(
                 model=self.settings.llm_model,
                 temperature=0.1,
-                max_tokens=300,
+                max_tokens=16384,
                 messages=[
                     {
                         "role": "system",
@@ -1839,10 +2436,9 @@ class GraphRAGService:
                     },
                 ],
             )
-            content = response.content.strip()
-            # 清理可能的 markdown code block
-            content = re.sub(r"^```[a-zA-Z]*\n?|```$", "", content, flags=re.MULTILINE).strip()
+            content = _sanitize_llm_json_content(response.content)
             expanded_terms = json.loads(content)
+            
             if isinstance(expanded_terms, list) and expanded_terms:
                 valid_terms = [str(t).strip() for t in expanded_terms if t and str(t).strip()]
                 expanded = query_text + " " + " ".join(valid_terms)
@@ -1857,6 +2453,7 @@ class GraphRAGService:
         query_text: str,
         top_k: int = 5,
         paper_ids: Optional[List[int]] = None,
+        strict_paper_filter: bool = False,
     ) -> Dict[str, Any]:
         """基于向量索引执行相似度检索。检索前先通过 LLM 扩展 query 中的实体（中英文），再向量化检索。"""
         self._ensure_embedding_ready()
@@ -1960,7 +2557,11 @@ class GraphRAGService:
             all_rows.extend(base_rows)
 
             # 第二阶段：若过滤后召回过少，放宽到全库补齐。
-            if len(base_rows) < effective_top_k and normalized_paper_ids is not None:
+            if (
+                len(base_rows) < effective_top_k
+                and normalized_paper_ids is not None
+                and not strict_paper_filter
+            ):
                 relaxed_vector_rows = list(
                     session.run(
                         vector_query,
@@ -1994,7 +2595,11 @@ class GraphRAGService:
                     search_mode = "keyword_fallback"
                     merged_rows = _dedupe_rows(merged_rows + lexical_rows)
 
-            if len(merged_rows) < max(3, effective_top_k // 2) and normalized_paper_ids is not None:
+            if (
+                len(merged_rows) < max(3, effective_top_k // 2)
+                and normalized_paper_ids is not None
+                and not strict_paper_filter
+            ):
                 relaxed_lexical_rows = list(
                     session.run(
                         keyword_query,
@@ -2008,6 +2613,17 @@ class GraphRAGService:
                 if relaxed_lexical_rows:
                     search_mode = "keyword_fallback_relaxed_paper_filter"
                     merged_rows = _dedupe_rows(merged_rows + relaxed_lexical_rows)
+
+        if strict_paper_filter and normalized_paper_ids is not None:
+            allowed_ids = set(normalized_paper_ids)
+            merged_rows = [
+                row for row in merged_rows
+                if row.get("paper_id") is not None and int(row.get("paper_id")) in allowed_ids
+            ]
+            if search_mode == "vector":
+                search_mode = "vector_strict_paper_filter"
+            elif search_mode == "keyword_fallback":
+                search_mode = "keyword_fallback_strict_paper_filter"
 
         rows = merged_rows[:effective_top_k]
 

@@ -193,7 +193,7 @@ GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT = (
     3. **核心算子**：包含该技术常用的损失函数、特征操作或数学表达术语。
 
     # Constraints
-    - **输出格式**：必须且仅返回一个 JSON 字符串数组。
+    - **输出格式**：必须返回且仅返回一个 JSON 字符串数组。
     - **严禁事项**：禁止任何 Markdown 代码块标签（如 ```json）、禁止解释、禁止前导词、禁止非学术常用词。
 
     # Example
