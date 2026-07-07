@@ -18,11 +18,11 @@ except Exception:
 
 from neo4j import GraphDatabase
 
-from graphrag.graphrag_config import GraphRAGSettings, get_graphrag_settings
+from graphrag_module.config import GraphRAGSettings, get_graphrag_settings
 from database import SessionLocal
 from models import KnowledgeBase
 from utils.model import ask_messages, LLMError
-from prompt import (
+from graphrag_module.prompts import (
     GRAPHRAG_QUERY_ENTITY_EXPANSION_SYSTEM_PROMPT,
     GRAPHRAG_QUERY_ENTITY_EXPANSION_USER_PROMPT_TEMPLATE,
 )
@@ -40,6 +40,10 @@ except Exception as e:
     create_vector_index = None
     VectorRetriever = None
     GRAPHRAG_IMPORT_ERROR = e
+
+
+MODULE_DIR = os.path.dirname(__file__)
+DEFAULT_ONTOLOGY_FILE = os.path.join(MODULE_DIR, "resources", "CSO.3.5.nt")
 
 
 class LocalEmbeddings:
@@ -1643,7 +1647,7 @@ class GraphRAGService:
         self,
         create_vector_index: bool = True,
         force_recreate_index: bool = False,
-        ontology_file_path: str = "CSO.3.5.nt",
+        ontology_file_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """准备本地图数据库环境并返回当前统计信息。"""
         self._ensure_initialized()
@@ -1652,7 +1656,7 @@ class GraphRAGService:
         if create_vector_index:
             index_result = self.ensure_vector_index(force_recreate=force_recreate_index)
 
-        ontology_path = ontology_file_path
+        ontology_path = ontology_file_path or DEFAULT_ONTOLOGY_FILE
         if not os.path.isabs(ontology_path):
             project_root = os.path.dirname(os.path.dirname(__file__))
             ontology_path = os.path.join(project_root, os.path.normpath(ontology_path).replace("src\\", "").replace("src/", ""))

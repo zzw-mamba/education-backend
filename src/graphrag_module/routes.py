@@ -1,3 +1,20 @@
+"""GraphRAG 路由模块
+
+提供知识图谱检索增强生成 (GraphRAG) 的 REST API 接口。
+
+主要功能：
+- 服务健康检查和诊断
+- 数据库初始化和索引管理
+- 论文切片数据的 upsert 操作
+- 从 MySQL 同步数据到 Neo4j
+- 临时 OCR 会话管理
+- 基于图结构的论文摘要生成
+- 向量相似度搜索和 RAG 检索
+- 相关论文推荐
+
+所有接口均挂载在 /api/graphrag 路径下。
+"""
+
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -5,7 +22,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
+from graphrag_module.service import DEFAULT_ONTOLOGY_FILE, get_graphrag_service, GRAPHRAG_IMPORT_ERROR
 
 
 router = APIRouter(prefix="/api/graphrag", tags=["graphrag"])
@@ -74,7 +91,7 @@ class SyncFromMySQLRequest(BaseModel):
 class SetupLocalDBRequest(BaseModel):
     create_vector_index: bool = True
     force_recreate_index: bool = False
-    ontology_file_path: str = Field(default="src/CSO.3.5.nt", description="本体 N-Triples 文件路径")
+    ontology_file_path: Optional[str] = Field(default=DEFAULT_ONTOLOGY_FILE, description="本体 N-Triples 文件路径")
     sync_from_mysql: bool = False
     paper_ids: Optional[List[int]] = None
     limit: int = Field(default=DEFAULT_SYNC_LIMIT, ge=1, le=20000)

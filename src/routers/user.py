@@ -1,3 +1,21 @@
+"""用户认证路由模块
+
+提供用户注册、登录、信息更新、密码修改等认证相关功能。
+
+主要端点：
+- POST /auth/register: 用户注册
+- POST /auth/login: 用户登录（返回JWT Token）
+- GET /auth/me: 获取当前用户信息
+- PUT /auth/update: 更新用户信息
+- POST /auth/change-password: 修改密码
+
+主要函数：
+- get_current_user: JWT Token验证依赖
+- create_access_token: 创建访问令牌
+- verify_password: 验证密码
+- get_password_hash: 生成密码哈希
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -8,13 +26,16 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from database import get_db
 from models import User
+import os
 
 router = APIRouter(prefix="/auth", tags=["User"])
 
 # JWT 配置
-SECRET_KEY = "your-secret-key-here-change-in-production"  # 生产环境应从环境变量读取
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+SECRET_KEY = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY 未配置，请在 .env 中设置用于签发 JWT 的密钥。")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
 # 密码哈希配置
 # 当前环境里 bcrypt 5.x 与 passlib 1.7.4 存在兼容性问题，主方案改用 argon2；

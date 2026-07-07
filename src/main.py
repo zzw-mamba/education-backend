@@ -1,62 +1,71 @@
+"""FastAPI 应用入口模块
+
+ResearchGraph-RAG 后端服务的主入口，负责：
+1. 应用生命周期管理（启动/关闭）
+2. 路由注册
+3. CORS 配置
+4. 静态文件服务
+
+主要组件：
+- lifespan: 应用生命周期管理器
+- app: FastAPI 应用实例
+- /health: 健康检查端点
+"""
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 import models
-from database import engine, init_db
+from database import init_db
 import os
-from routers import ocr, db_routes, user, template, parsing, graphrag_routes, log
-import subprocess
-import asyncio
-from graphrag.graphrag_service import get_graphrag_service
-from neoTools.neo4j_config import init_neo4j_driver, close_neo4j_driver, Neo4jConnectionError
+from routers import ocr, db_routes, user, template, parsing, log
+from graphrag_module import graphrag_shutdown, graphrag_startup, router as graphrag_router
 
-LLM_IP = os.getenv("LLM_IP")
-LOCAL_EMBEDDING_IP = os.getenv("LOCAL_EMBEDDING_IP")
 
-SSH_COMMAND = [
-    "ssh", "-N", 
-    "-p", "23686", 
-    "-o", "ServerAliveInterval=30",
-    "-L", "8080:" + LLM_IP + ":8000",
-    "-L", "9091:" + LOCAL_EMBEDDING_IP + ":8000",
-    "root@cci-proxy.cn-sh-01.sensecore.cn"
-]
+def _to_bool(value: str | None) -> bool:
+    """将字符串值转换为布尔值。
+    
+    支持的真值: "1", "true", "yes", "on"（不区分大小写）
+    
+    Args:
+        value: 待转换的字符串值
+        
+    Returns:
+        bool: 转换后的布尔值
+    """
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ssh_process = subprocess.Popen(SSH_COMMAND)
+    """FastAPI 应用生命周期管理器。
+    
+    在应用启动时执行初始化操作，在应用关闭时执行清理操作。
+    
+    启动时：
+    1. 初始化数据库表
+    2. 启动 GraphRAG 模块
+    
+    关闭时：
+    1. 关闭 GraphRAG 模块
+    
+    Args:
+        app: FastAPI 应用实例
+        
+    Yields:
+        None
+    """
     init_db()
-    try:
-        init_neo4j_driver()
-    except Neo4jConnectionError as e:
-        print(f"[Neo4j] ✗ 启动时初始化失败，将在请求时重试: {e}")
-
-    auto_setup_local_neo4j = os.getenv("AUTO_SETUP_LOCAL_NEO4J", "false").lower() == "true"
-    if auto_setup_local_neo4j:
-        try:
-            graphrag_service = get_graphrag_service()
-            graphrag_service.setup_local_database(create_vector_index=True, force_recreate_index=False)
-            print("[GraphRAG] ✓ 本地 Neo4j schema/index 初始化完成")
-        except Exception as e:
-            print(f"[GraphRAG] ✗ 本地 Neo4j 自动初始化失败: {e}")
-    await asyncio.sleep(2) 
+    graphrag_startup(auto_setup_local_neo4j=_to_bool(os.getenv("AUTO_SETUP_LOCAL_NEO4J")))
     yield
-
-    close_neo4j_driver()
-
-    if ssh_process.poll() is None:  # 检查SSH进程是否还在运行
-        ssh_process.terminate()     # 终止进程
-        ssh_process.wait()          # 等待进程退出
-        print(f"[SSH] 进程（PID: {ssh_process.pid}）已终止")
+    graphrag_shutdown()
 
 
-
-app = FastAPI(title="Backend Service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ResearchGraph-RAG Backend", version="0.1.0", lifespan=lifespan)
 
 analysis_results_dir = Path(__file__).resolve().parents[1] / "analysis_results"
 analysis_results_dir.mkdir(parents=True, exist_ok=True)
@@ -74,37 +83,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册路由模块
 app.include_router(ocr.router)
 app.include_router(db_routes.router)
 app.include_router(user.router)
 app.include_router(template.router)
 app.include_router(parsing.router)
-app.include_router(graphrag_routes.router)
+app.include_router(graphrag_router)
 app.include_router(log.router)
-
-class Item(BaseModel):
-    name: str
-    description: str | None = None
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health() -> dict[str, str]:
-    """Lightweight health probe."""
+    """健康检查端点。
+    
+    返回应用的运行状态，用于监控和负载均衡探测。
+    
+    Returns:
+        dict: 包含状态信息的字典，如 {"status": "ok"}
+    """
     return {"status": "ok"}
-
-
-@app.get("/", status_code=status.HTTP_200_OK)
-async def read_root() -> dict[str, str]:
-    return {"message": "FastAPI is running"}
-
-
-@app.post("/items", status_code=status.HTTP_201_CREATED)
-async def create_item(item: Item) -> Item:
-    return item
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("APP_PORT", "8000")),
+        reload=_to_bool(os.getenv("APP_RELOAD", "true")),
+    )

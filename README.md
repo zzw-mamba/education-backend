@@ -6,7 +6,7 @@
 - 知识库（MySQL）入库、检索与推荐
 - OCR / 文档解析（UniParse）
 - 基于 Neo4j 的知识图谱能力
-- 基于 Neo4j + 向量索引 + 本地 LLM 的 GraphRAG 检索增强问答与摘要
+- 基于 Neo4j + 向量索引 + API LLM 的 GraphRAG 检索增强问答与摘要
 
 ## 1. 项目结构
 
@@ -31,14 +31,16 @@ backend/
 │  │  ├─ user.py
 │  │  ├─ template.py
 │  │  ├─ parsing.py
-│  │  ├─ graphrag_routes.py
-│  │  └─ neo4j_routes.py
-│  ├─ graphrag/
-│  │  ├─ graphrag_config.py
-│  │  └─ graphrag_service.py
-│  ├─ neo4j/
+│  │  └─ log.py
+│  ├─ graphrag_module/
+│  │  ├─ config.py
+│  │  ├─ service.py
+│  │  ├─ routes.py
+│  │  ├─ lifecycle.py
 │  │  ├─ neo4j_config.py
-│  │  └─ neo4j_utils.py
+│  │  ├─ prompts.py
+│  │  ├─ resources/
+│  │  └─ tests/
 │  └─ utils/
 │     ├─ model.py
 │     └─ get_resources_content.py
@@ -75,7 +77,6 @@ backend/
   - FastAPI 应用入口。
   - 注册路由：OCR、数据库、用户、模板、解析、GraphRAG。
   - 应用生命周期中执行：
-    - 启动 SSH 隧道（依赖 `LLM_IP`、`LOCAL_EMBEDDING_IP`）。
     - 初始化 MySQL 表。
     - 可选自动初始化本地 Neo4j GraphRAG schema/index（`AUTO_SETUP_LOCAL_NEO4J=true`）。
 - `src/database.py`
@@ -108,17 +109,14 @@ backend/
 - `src/routers/parsing.py`
   - 按知识库 ID 批量拉取内容并调用 LLM 做结构化解析。
   - 结果写入 `analysis_results/`，同时记录日志。
-- `src/routers/graphrag_routes.py`
-  - GraphRAG 专用接口：健康检查、诊断、schema/index 初始化、从 MySQL 同步、相似检索、RAG 搜索、论文摘要。
-- `src/routers/neo4j_routes.py`
-  - 通用 Neo4j 图能力 API（构图、图分析、最短路径、用户搜索行为图谱）。
+- GraphRAG API 已收敛到 `src/graphrag_module/routes.py`，主应用通过模块 router 注册。
 
-### 3.4 `src/graphrag/` GraphRAG 核心
+### 3.4 `src/graphrag_module/` GraphRAG 模块
 
-- `src/graphrag/graphrag_config.py`
+- `src/graphrag_module/config.py`
   - GraphRAG 配置数据类（Neo4j、向量索引、Embedding、LLM）。
   - 从环境变量读取并校验。
-- `src/graphrag/graphrag_service.py`
+- `src/graphrag_module/service.py`
   - GraphRAG 核心服务实现：
     - 章节感知 + 语义窗口切片
     - 实体抽取（LLM + 启发式回退）
@@ -126,16 +124,16 @@ backend/
     - MySQL -> Neo4j 同步
     - 向量相似检索、RAG 问答
     - 图上下文精炼与论文摘要生成
-
-### 3.5 `src/neo4j/` 通用图工具
-
-- `src/neo4j/neo4j_config.py`
-  - Neo4j 驱动初始化与基础增删改查封装。
-- `src/neo4j/neo4j_utils.py`
-  - 三类图工具：
-    - `KnowledgeGraph`：知识图谱构建与标签查询
-    - `GraphAnalysis`：中心性、连通性、路径、统计
-    - `UserBehaviorGraph`：搜索行为记录与分析
+- `src/graphrag_module/routes.py`
+  - GraphRAG 专用接口：健康检查、诊断、schema/index 初始化、从 MySQL 同步、相似检索、RAG 搜索、论文摘要。
+- `src/graphrag_module/lifecycle.py`
+  - 向主 FastAPI 应用暴露 GraphRAG 启动与关闭钩子。
+- `src/graphrag_module/neo4j_config.py`
+  - GraphRAG 模块使用的 Neo4j 驱动初始化与关闭逻辑。
+- `src/graphrag_module/prompts.py`
+  - GraphRAG 专用提示词。
+- `src/graphrag_module/resources/`
+  - GraphRAG 资源文件，例如 CSO 本体。
 
 ### 3.6 `src/utils/` 工具层
 
@@ -181,7 +179,12 @@ pip install neo4j neo4j-graphrag
 
 ```env
 # MySQL
-DATABASE_URL=mysql+pymysql://root:password@localhost:3306/graduation_project
+DATABASE_URL=mysql+pymysql://user:password@localhost:3306/graduation_design
+
+# JWT
+JWT_SECRET_KEY=replace-with-a-long-random-secret
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
 
 # UniParse
 PARSER_API=your_uniparse_token
@@ -198,14 +201,11 @@ GRAPHRAG_EMBEDDING_DIMENSIONS=4096
 LOCAL_EMBEDDING_BASE_URL=http://localhost:9091
 LOCAL_EMBEDDING_API_PATH=/v1/embeddings
 
-# LLM
-LLM_API_BASE=http://127.0.0.1:8000/v1
+# LLM API（OpenAI-compatible）
+LLM_API_BASE=https://api.example.com/v1
 LLM_MODEL=your_llm_model
-LLM_API_KEY=
+LLM_API_KEY=your_llm_api_key
 
-# main.py 中 SSH 隧道相关
-LLM_IP=127.0.0.1
-LOCAL_EMBEDDING_IP=127.0.0.1
 AUTO_SETUP_LOCAL_NEO4J=false
 ```
 
@@ -280,7 +280,5 @@ python main.py
 
 ## 9. 开发建议
 
-- `src/main.py` 里包含 SSH 隧道启动逻辑；本地无该环境时，建议先注释或通过环境变量控制。
-- `src/neo4j/neo4j_utils.py` 目前使用 `from neo4j_config import ...`，运行路径变化时可能触发导入问题，建议改为包内绝对导入（如 `from neo4j.neo4j_config import ...`）。
+- 大模型调用通过 `LLM_API_BASE / LLM_MODEL / LLM_API_KEY` 直接访问 OpenAI-compatible HTTP API。
 - `.env` 和任何包含密钥、密码的配置文件不要提交到 Git。
-

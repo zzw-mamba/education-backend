@@ -1,3 +1,21 @@
+"""知识库操作路由模块
+
+提供知识库的增删改查、全文检索、推荐和文件下载功能。
+
+主要端点：
+- POST /knowledge/add: 添加知识条目（自动提取标签）
+- GET /knowledge/search: 全文检索（支持LLM扩展和重排）
+- GET /knowledge/recommend: 基于标签重合度推荐相似条目
+- GET /knowledge/recommend/{kb_id}: 单篇文章推荐
+- GET /knowledge/content/{kb_id}: 获取知识内容
+- GET /knowledge/file/{file_id}: 下载关联文件
+
+主要辅助函数：
+- _resolve_existing_file_path: 解析文件路径
+- _expand_search_terms_with_llm: 使用LLM扩展搜索词
+- rerank_documents: 文档相关性重排
+"""
+
 import jieba.analyse
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -269,15 +287,6 @@ def rerank_documents(query: str, docs: List[dict], top_k: int = 5) -> List[dict]
         return docs
 
     return rerank_documents_with_llm(query, docs, top_k)
-
-# --- 1. 测试连接 (保留并增强) ---
-@router.get("/db-test")
-def test_db_connection(db: Session = Depends(get_db)):
-    try:
-        db.execute(text("SELECT 1"))
-        return {"status": "success", "message": "Database connection established!"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
 class AddKnowledgeRequest(BaseModel):
     title: str

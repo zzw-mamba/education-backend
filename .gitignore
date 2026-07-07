@@ -1,5 +1,83 @@
+# Python
 **/__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+develop-eggs/
+eggs/
+.eggs/
+.installed.cfg
+*.whl
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.coverage.*
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Type checking
+.mypy_cache/
+.pytype/
+.pyi/
+.dmypy.json
+dmypy.json
+*.mypy_cache/
+
+# Linting
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+*.conda/
+miniforge3/envs/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+database/
+
+# Uploads and temporary files
 /template_json
 /analysis_results
 /temp
@@ -7,7 +85,31 @@
 /uploaded_files
 /bibs
 /ocr_outputs/
-.env
-.idea/
-database/
-*.db
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# TRAE
+.trae/
+
+# Pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Conda
+conda-meta/
+conda-lock.yml
+
+# Node.js (if applicable)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Cache
+.cache/
+.parallel/

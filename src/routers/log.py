@@ -1,4 +1,10 @@
+"""生成日志路由模块
+
+提供用户生成历史记录的查询功能，支持分页和按时间排序。
+"""
+
 from datetime import datetime
+from typing import List
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session

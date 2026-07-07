@@ -118,8 +118,14 @@ def _to_bool(value: str) -> bool:
 
 
 def get_env_config() -> LLMConfig:
-    api_base = os.getenv("LLM_API_BASE", "http://127.0.0.1:8000/v1")
-    model = os.getenv("LLM_MODEL", os.getenv("MODEL_NAME", "gpt-4o-mini"))
+    api_base = os.getenv("LLM_API_BASE")
+    if not api_base:
+        raise RuntimeError("LLM_API_BASE 未配置，请在 .env 中设置大模型 API 地址。")
+
+    model = os.getenv("LLM_MODEL") or os.getenv("MODEL_NAME")
+    if not model:
+        raise RuntimeError("LLM_MODEL 未配置，请在 .env 中设置大模型名称。")
+
     api_key = os.getenv("LLM_API_KEY", "")
     timeout = int(os.getenv("LLM_TIMEOUT", "120"))
     verify_ssl = _to_bool(os.getenv("LLM_VERIFY_SSL", "true"))

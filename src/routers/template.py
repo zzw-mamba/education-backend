@@ -1,3 +1,25 @@
+"""模板管理路由模块
+
+提供模板的创建、更新、删除、复制和基于模板生成摘要的功能。
+
+主要端点：
+- POST /template/build: 根据描述生成模板
+- PUT /template/add: 保存模板
+- PUT /template/{template_id}: 更新模板
+- DELETE /template/{template_id}: 删除模板
+- POST /template/{template_id}/duplicate: 复制模板
+- POST /template/{template_id}/summary: 基于模板生成摘要
+- POST /template/{template_id}/summary-jobs: 创建异步摘要任务
+- GET /template/summary-jobs/{job_id}: 查询摘要任务状态
+- GET /template/my: 获取当前用户可见模板
+
+主要辅助函数：
+- _execute_summary_generation: 执行摘要生成
+- _format_document_chunks: 格式化文档片段
+- _format_graph_context: 格式化图谱上下文
+- _export_summary_bundle: 导出摘要文件（MD/DOCX/PDF）
+"""
+
 import ast
 import html
 import json
@@ -19,7 +41,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from database import get_db, SessionLocal
 from models import Template, User, Log
-from graphrag.graphrag_service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
+from graphrag_module.service import get_graphrag_service, GRAPHRAG_IMPORT_ERROR
 from routers.user import get_current_user
 from utils.model import ask_messages, LLMError
 
